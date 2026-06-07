@@ -176,7 +176,82 @@ server.registerTool(
   },
 );
 
-// --- 7. Connect over stdio and start serving -------------------------------
+// --- 7. Register the read-only "list_transactions" tool --------------------
+// Introduces an OPTIONAL argument. sinceDate is z.string().optional(), so
+// Claude may pass it or omit it; omitted -> undefined -> YNAB returns all.
+// The .regex() rejects a malformed date before any API call. Transactions can
+// be numerous, so we sort newest-first and cap the output, reporting the cap
+// rather than hiding rows silently.
+const TRANSACTION_LIMIT = 50;
+server.registerTool(
+  "list_transactions",
+  {
+    title: "List transactions in a YNAB budget",
+    description:
+      "List transactions in a given YNAB budget, newest first, showing each " +
+      "one's date, payee, category, amount, and account. Optionally pass " +
+      `sinceDate to only include transactions on or after that date. Capped ` +
+      `at ${TRANSACTION_LIMIT} results. Read-only. Use list_budgets first to ` +
+      "find the budgetId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget to list transactions for."),
+      sinceDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/, "sinceDate must be ISO format YYYY-MM-DD")
+        .optional()
+        .describe(
+          "Only include transactions on or after this date (YYYY-MM-DD). " +
+            "Omit to return the most recent transactions overall.",
+        ),
+    },
+  },
+  async ({ budgetId, sinceDate }) => {
+    // sinceDate is undefined when omitted — exactly what the SDK expects.
+    const response = await ynabAPI.transactions.getTransactions(
+      budgetId,
+      sinceDate,
+    );
+    const transactions = response.data.transactions.filter((t) => !t.deleted);
+
+    // Copy before sorting (don't mutate the SDK's array); ISO dates sort
+    // correctly as plain strings, so descending = newest first.
+    const sorted = [...transactions].sort((a, b) =>
+      b.date.localeCompare(a.date),
+    );
+    const shown = sorted.slice(0, TRANSACTION_LIMIT);
+
+    const lines = shown
+      .map((t) => {
+        const payee = t.payee_name ?? "(no payee)";
+        const category = t.category_name ?? "(uncategorized)";
+        return (
+          `- ${t.date} | ${payee} | ${category} | ` +
+          `${formatMilliunits(t.amount)} [${t.account_name}]`
+        );
+      })
+      .join("\n");
+
+    let text: string;
+    if (shown.length === 0) {
+      text = sinceDate
+        ? `No transactions found on or after ${sinceDate}.`
+        : "No transactions found in this budget.";
+    } else {
+      const scope = sinceDate ? ` since ${sinceDate}` : "";
+      const truncated =
+        sorted.length > shown.length
+          ? ` (showing the ${shown.length} most recent of ${sorted.length})`
+          : "";
+      text = `Transactions${scope}${truncated}:\n${lines}`;
+    }
+
+    return { content: [{ type: "text", text }] };
+  },
+);
+
+// --- 8. Connect over stdio and start serving -------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.
