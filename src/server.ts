@@ -179,16 +179,13 @@ server.registerTool(
 );
 
 // --- 7. Register the read-only "list_transactions" tool --------------------
-// Introduces an OPTIONAL argument. sinceDate is z.string().optional(), so
-// Claude may pass it or omit it; omitted -> undefined -> YNAB returns all.
-// The .regex() rejects a malformed date before any API call. Transactions can
-// be numerous, so we sort newest-first and cap the output, reporting the cap
-// rather than hiding rows silently.
-//
-// TODO: add an optional `type` argument — getTransactions accepts a third
-// positional arg, the enum "uncategorized" | "unapproved". Expose it as
-// type: z.enum(["uncategorized", "unapproved"]).optional() and pass it through
-// so Claude can ask "what's uncategorized / unapproved?". See docs/ynab-api.md.
+// Introduces OPTIONAL arguments. sinceDate is z.string().optional(), so Claude
+// may pass it or omit it; omitted -> undefined -> YNAB returns all. The
+// .regex() rejects a malformed date before any API call. The optional `type`
+// filter narrows to YNAB's "uncategorized" or "unapproved" rows — z.enum
+// produces exactly the union the SDK's getTransactions wants, so it passes
+// through with no cast. Transactions can be numerous, so we sort newest-first
+// and cap the output, reporting the cap rather than hiding rows silently.
 const TRANSACTION_LIMIT = 50;
 server.registerTool(
   "list_transactions",
@@ -197,7 +194,8 @@ server.registerTool(
     description:
       "List transactions in a given YNAB budget, newest first, showing each " +
       "one's date, payee, category, amount, and account. Optionally pass " +
-      `sinceDate to only include transactions on or after that date. Capped ` +
+      "sinceDate to only include transactions on or after that date, and/or " +
+      "type to return only uncategorized or unapproved transactions. Capped " +
       `at ${TRANSACTION_LIMIT} results. Read-only. Use list_budgets first to ` +
       "find the budgetId.",
     inputSchema: {
@@ -212,13 +210,21 @@ server.registerTool(
           "Only include transactions on or after this date (YYYY-MM-DD). " +
             "Omit to return the most recent transactions overall.",
         ),
+      type: z
+        .enum(["uncategorized", "unapproved"])
+        .optional()
+        .describe(
+          "Optionally return only 'uncategorized' or only 'unapproved' " +
+            "transactions. Omit to return all types.",
+        ),
     },
   },
-  async ({ budgetId, sinceDate }) => {
-    // sinceDate is undefined when omitted — exactly what the SDK expects.
+  async ({ budgetId, sinceDate, type }) => {
+    // sinceDate/type are undefined when omitted — exactly what the SDK expects.
     const response = await ynabAPI.transactions.getTransactions(
       budgetId,
       sinceDate,
+      type,
     );
     const transactions = response.data.transactions.filter((t) => !t.deleted);
 
