@@ -182,6 +182,11 @@ server.registerTool(
 // The .regex() rejects a malformed date before any API call. Transactions can
 // be numerous, so we sort newest-first and cap the output, reporting the cap
 // rather than hiding rows silently.
+//
+// TODO: add an optional `type` argument — getTransactions accepts a third
+// positional arg, the enum "uncategorized" | "unapproved". Expose it as
+// type: z.enum(["uncategorized", "unapproved"]).optional() and pass it through
+// so Claude can ask "what's uncategorized / unapproved?". See docs/ynab-api.md.
 const TRANSACTION_LIMIT = 50;
 server.registerTool(
   "list_transactions",
