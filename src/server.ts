@@ -121,7 +121,62 @@ server.registerTool(
   },
 );
 
-// --- 6. Connect over stdio and start serving -------------------------------
+// --- 6. Register the read-only "list_categories" tool ----------------------
+// Nested data: YNAB returns category_groups, and each group holds its own
+// categories[]. So we iterate two levels — groups outside, categories inside.
+// We skip hidden/deleted at both levels (YNAB keeps a hidden "Internal Master
+// Category" group for bookkeeping like "Inflow: Ready to Assign").
+server.registerTool(
+  "list_categories",
+  {
+    title: "List categories in a YNAB budget",
+    description:
+      "List the budget categories grouped by category group, with each " +
+      "category's budgeted, activity, and balance amounts for the current " +
+      "month. Hidden and deleted items are omitted. Read-only. Use " +
+      "list_budgets first to find the budgetId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget to list categories for."),
+    },
+  },
+  async ({ budgetId }) => {
+    const response = await ynabAPI.categories.getCategories(budgetId);
+    const groups = response.data.category_groups.filter(
+      (g) => !g.hidden && !g.deleted,
+    );
+
+    // Build one block per group: a header line, then its categories indented.
+    const blocks = groups
+      .map((group) => {
+        const categories = group.categories.filter(
+          (c) => !c.hidden && !c.deleted,
+        );
+        if (categories.length === 0) return null; // nothing visible to show
+
+        const catLines = categories
+          .map(
+            (c) =>
+              `  - ${c.name}: budgeted ${formatMilliunits(c.budgeted)}, ` +
+              `activity ${formatMilliunits(c.activity)}, ` +
+              `balance ${formatMilliunits(c.balance)}`,
+          )
+          .join("\n");
+        return `${group.name}\n${catLines}`;
+      })
+      .filter((block) => block !== null);
+
+    const text =
+      blocks.length > 0
+        ? blocks.join("\n\n")
+        : "No visible categories found in this budget.";
+
+    return { content: [{ type: "text", text }] };
+  },
+);
+
+// --- 7. Connect over stdio and start serving -------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.
