@@ -54,9 +54,20 @@ if (!budgetId) {
 }
 console.log(`\n>>> Using budgetId ${budgetId} for the remaining tools.`);
 
-// 3. The three argument-taking read tools, against the real budget.
+// 3. The argument-taking read tools, against the real budget.
 await callAndPrint("list_accounts", { budgetId });
 await callAndPrint("list_categories", { budgetId });
-await callAndPrint("list_transactions", { budgetId });
+
+// list_transactions: exercise delta caching + paging + the type filter.
+// First call = full fetch (watch for the server's "[cache] ... full fetch").
+await callAndPrint("list_transactions", { budgetId, limit: 3 });
+// Second call = cheap delta reuse ("[cache] ... delta merged"), page 2.
+await callAndPrint("list_transactions", { budgetId, limit: 3, offset: 3 });
+// Type filter: only rows still needing a category.
+await callAndPrint("list_transactions", {
+  budgetId,
+  type: "uncategorized",
+  limit: 5,
+});
 
 await client.close(); // shuts down the child server process

@@ -178,26 +178,79 @@ server.registerTool(
   },
 );
 
+// --- Transaction cache (YNAB delta sync) -----------------------------------
+// We cache each budget's full transaction set so paging and filters don't
+// re-fetch thousands of rows. Per budget we store:
+//   serverKnowledge — YNAB's cursor: the point our cache is current to. Handed
+//                     back on the next request to fetch only what changed since.
+//   byId            — the transactions themselves, keyed by id, so a changed
+//                     row is an overwrite and a deleted row is a delete (O(1)).
+interface TransactionCacheEntry {
+  serverKnowledge: number;
+  byId: Map<string, ynab.TransactionDetail>;
+}
+// Keyed by budgetId — each budget syncs independently.
+const transactionCache = new Map<string, TransactionCacheEntry>();
+
+// Returns the complete, current transaction set for a budget; callers apply
+// their own date/type/paging filters on top. forceRefresh discards the cache
+// and re-downloads everything from scratch.
+async function getAllTransactions(
+  budgetId: string,
+  forceRefresh: boolean,
+): Promise<ynab.TransactionDetail[]> {
+  const cached = forceRefresh ? undefined : transactionCache.get(budgetId);
+
+  // Fetch the WHOLE budget (no sinceDate/type) so the cache stays complete and
+  // delta sync stays coherent. cursor undefined on the first call -> full set.
+  const response = await ynabAPI.transactions.getTransactions(
+    budgetId,
+    undefined,
+    undefined,
+    cached?.serverKnowledge,
+  );
+
+  // Merge the delta into the cache: drop deletions, upsert everything else.
+  const byId = cached?.byId ?? new Map<string, ynab.TransactionDetail>();
+  for (const txn of response.data.transactions) {
+    if (txn.deleted) byId.delete(txn.id);
+    else byId.set(txn.id, txn);
+  }
+
+  // Observability (stderr only): full fetch vs cheap delta.
+  console.error(
+    cached
+      ? `[cache] ${budgetId}: delta merged ${response.data.transactions.length} change(s) -> ${byId.size} total`
+      : `[cache] ${budgetId}: full fetch of ${byId.size} transaction(s)`,
+  );
+
+  transactionCache.set(budgetId, {
+    serverKnowledge: response.data.server_knowledge,
+    byId,
+  });
+  return [...byId.values()];
+}
+
 // --- 7. Register the read-only "list_transactions" tool --------------------
-// Introduces OPTIONAL arguments. sinceDate is z.string().optional(), so Claude
-// may pass it or omit it; omitted -> undefined -> YNAB returns all. The
-// .regex() rejects a malformed date before any API call. The optional `type`
-// filter narrows to YNAB's "uncategorized" or "unapproved" rows — z.enum
-// produces exactly the union the SDK's getTransactions wants, so it passes
-// through with no cast. Transactions can be numerous, so we sort newest-first
-// and cap the output, reporting the cap rather than hiding rows silently.
-const TRANSACTION_LIMIT = 50;
+// Reads from the delta-synced cache (getAllTransactions) and applies ALL
+// filtering client-side: sinceDate (date string compare), type ('unapproved'
+// is exact; 'uncategorized' is approximated as a row needing a category — not
+// categorized, not a transfer, not a split parent), and limit/offset paging.
+// The response always reports the window shown out of the matching total.
+const DEFAULT_TRANSACTION_LIMIT = 50; // used when Claude omits `limit`
+const MAX_TRANSACTION_LIMIT = 200; // ceiling on any single response
 server.registerTool(
   "list_transactions",
   {
     title: "List transactions in a YNAB budget",
     description:
       "List transactions in a given YNAB budget, newest first, showing each " +
-      "one's date, payee, category, amount, and account. Optionally pass " +
-      "sinceDate to only include transactions on or after that date, and/or " +
-      "type to return only uncategorized or unapproved transactions. Capped " +
-      `at ${TRANSACTION_LIMIT} results. Read-only. Use list_budgets first to ` +
-      "find the budgetId.",
+      "one's date, payee, category, amount, and account. Optional filters: " +
+      "sinceDate (on or after a date) and type (uncategorized or unapproved). " +
+      "Page through results with limit and offset; the response reports the " +
+      `window shown out of the total (default limit ${DEFAULT_TRANSACTION_LIMIT}, ` +
+      `max ${MAX_TRANSACTION_LIMIT}). Read-only. Use list_budgets first to find ` +
+      "the budgetId.",
     inputSchema: {
       budgetId: z
         .string()
@@ -217,25 +270,59 @@ server.registerTool(
           "Optionally return only 'uncategorized' or only 'unapproved' " +
             "transactions. Omit to return all types.",
         ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_TRANSACTION_LIMIT)
+        .default(DEFAULT_TRANSACTION_LIMIT)
+        .describe(
+          `Max number of transactions to return (1-${MAX_TRANSACTION_LIMIT}). ` +
+            `Defaults to ${DEFAULT_TRANSACTION_LIMIT}.`,
+        ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe(
+          "How many transactions to skip from the newest, for paging. " +
+            "Defaults to 0.",
+        ),
+      refresh: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Force a full re-fetch from YNAB instead of the usual cheap delta " +
+            "sync. Rarely needed; defaults to false.",
+        ),
     },
   },
-  async ({ budgetId, sinceDate, type }) => {
-    // sinceDate/type are undefined when omitted — exactly what the SDK expects.
-    const response = await ynabAPI.transactions.getTransactions(
-      budgetId,
-      sinceDate,
-      type,
-    );
-    const transactions = response.data.transactions.filter((t) => !t.deleted);
+  async ({ budgetId, sinceDate, type, limit, offset, refresh }) => {
+    // One delta-synced fetch returns the complete, current set; filter locally.
+    const all = await getAllTransactions(budgetId, refresh);
 
-    // Copy before sorting (don't mutate the SDK's array); ISO dates sort
-    // correctly as plain strings, so descending = newest first.
-    const sorted = [...transactions].sort((a, b) =>
-      b.date.localeCompare(a.date),
-    );
-    const shown = sorted.slice(0, TRANSACTION_LIMIT);
+    let filtered = all;
+    if (sinceDate) filtered = filtered.filter((t) => t.date >= sinceDate);
+    if (type === "unapproved") {
+      filtered = filtered.filter((t) => !t.approved);
+    } else if (type === "uncategorized") {
+      // Approximates YNAB's server-side "uncategorized": a row that still needs
+      // a category — not yet categorized, not a transfer, not a split parent.
+      filtered = filtered.filter(
+        (t) =>
+          !t.category_id &&
+          !t.transfer_account_id &&
+          t.subtransactions.length === 0,
+      );
+    }
 
-    const lines = shown
+    // Newest first (ISO dates sort correctly as strings), then page.
+    const sorted = [...filtered].sort((a, b) => b.date.localeCompare(a.date));
+    const total = sorted.length;
+    const page = sorted.slice(offset, offset + limit);
+
+    const lines = page
       .map((t) => {
         const payee = t.payee_name ?? "(no payee)";
         const category = t.category_name ?? "(uncategorized)";
@@ -246,18 +333,24 @@ server.registerTool(
       })
       .join("\n");
 
+    // Describe the active filters for the header line.
+    const activeFilters = [
+      sinceDate ? `since ${sinceDate}` : null,
+      type ? `type=${type}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const scope = activeFilters ? ` (${activeFilters})` : "";
+
     let text: string;
-    if (shown.length === 0) {
-      text = sinceDate
-        ? `No transactions found on or after ${sinceDate}.`
-        : "No transactions found in this budget.";
+    if (total === 0) {
+      text = `No transactions found${scope}.`;
+    } else if (page.length === 0) {
+      text = `Offset ${offset} is past the ${total} matching transaction(s)${scope}.`;
     } else {
-      const scope = sinceDate ? ` since ${sinceDate}` : "";
-      const truncated =
-        sorted.length > shown.length
-          ? ` (showing the ${shown.length} most recent of ${sorted.length})`
-          : "";
-      text = `Transactions${scope}${truncated}:\n${lines}`;
+      const start = offset + 1;
+      const end = offset + page.length;
+      text = `Transactions${scope} — showing ${start}-${end} of ${total}:\n${lines}`;
     }
 
     return { content: [{ type: "text", text }] };
