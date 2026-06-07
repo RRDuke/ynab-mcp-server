@@ -11,6 +11,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as ynab from "ynab";
+import { z } from "zod";
 
 // --- 1. Read the secret token from the environment -------------------------
 // The real value lives only in the gitignored .env file, loaded via Node's
@@ -37,6 +38,23 @@ const server = new McpServer({
   name: "ynab-mcp-server",
   version: "0.1.0",
 });
+
+// --- Helpers ---------------------------------------------------------------
+// YNAB stores every monetary amount as an integer "milliunit": 1000 = $1.00,
+// so -43210 milliunits = -$43.21. Divide by 1000 and format as currency once,
+// here, so the tools below never repeat this conversion.
+//
+// Intl.NumberFormat is a built-in JS API (the ECMAScript Internationalization
+// API) — no import, no dependency. "en-US" picks the grouping/decimal style
+// (1,234.56) and { style: "currency", currency: "USD" } adds the $ and the
+// fixed 2 decimals, including correct negative signs. Currency is hardcoded to
+// USD for now; YNAB budgets carry their own currency_format we can honor later.
+function formatMilliunits(milliunits: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(milliunits / 1000);
+}
 
 // --- 4. Register the read-only "list_budgets" tool -------------------------
 // (A) name + config = the Claude-facing interface. The description is how
@@ -67,7 +85,43 @@ server.registerTool(
   },
 );
 
-// --- 5. Connect over stdio and start serving -------------------------------
+// --- 5. Register the read-only "list_accounts" tool ------------------------
+// First tool that takes an argument. inputSchema is a "Zod raw shape" (a plain
+// object of validators, NOT z.object({...})). The SDK validates Claude's input
+// against it before the callback runs and passes the parsed args in as the
+// first parameter — so { budgetId } below is already known to be a string.
+server.registerTool(
+  "list_accounts",
+  {
+    title: "List accounts in a YNAB budget",
+    description:
+      "List the accounts in a given YNAB budget, with each account's name, " +
+      "type, and current balance. Closed accounts are omitted. Read-only. " +
+      "Use list_budgets first to find the budgetId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget to list accounts for."),
+    },
+  },
+  async ({ budgetId }) => {
+    const response = await ynabAPI.accounts.getAccounts(budgetId);
+    // Skip accounts the user has closed — they're clutter, not current data.
+    const accounts = response.data.accounts.filter((a) => !a.closed);
+
+    const lines = accounts
+      .map((a) => `- ${a.name} [${a.type}]: ${formatMilliunits(a.balance)}`)
+      .join("\n");
+    const text =
+      accounts.length > 0
+        ? `Found ${accounts.length} open account(s):\n${lines}`
+        : "No open accounts found in this budget.";
+
+    return { content: [{ type: "text", text }] };
+  },
+);
+
+// --- 6. Connect over stdio and start serving -------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.
