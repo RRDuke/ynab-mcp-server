@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ynab": {
+      "command": "node",
+      "args": ["--env-file=.env", "dist/server.js"]
+    }
+  }
+}
