@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    // --- Output JS language level ---
+    // Node 24 supports modern JS, so we don't need to down-level much.
+    "target": "es2023",
+    "lib": ["es2023"],
+
+    // --- Module system ---
+    // "nodenext" makes TypeScript follow Node's real ESM rules, honoring
+    // the "type": "module" in package.json. Note: this requires explicit
+    // ".js" extensions on relative imports (e.g. import "./foo.js"), even
+    // though the source file is foo.ts. That trips everyone up once.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // --- Where source lives / where compiled output goes ---
+    "rootDir": "src",
+    "outDir": "dist",
+
+    // --- Type-checking strictness ---
+    // The whole reason to use TypeScript: catch bugs at compile time.
+    "strict": true,
+
+    // --- Quality-of-life ---
+    "esModuleInterop": true,   // smoother interop with CommonJS packages
+    "skipLibCheck": true,      // don't type-check inside dependencies (faster)
+    "sourceMap": true,         // map compiled JS back to .ts for debugging
+    "declaration": false,      // we're an app, not a library — no .d.ts needed
+    "forceConsistentCasingInFileNames": true
+  },
+  // Only compile our own source under src/.
+  "include": ["src/**/*.ts"]
+}
