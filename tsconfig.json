@@ -5,6 +5,11 @@
     "target": "es2023",
     "lib": ["es2023"],
 
+    // Load Node's global type definitions (process, console, etc.) from
+    // @types/node. Naming it explicitly loads ONLY node's globals — not every
+    // stray @types package a dependency might pull in.
+    "types": ["node"],
+
     // --- Module system ---
     // "nodenext" makes TypeScript follow Node's real ESM rules, honoring
     // the "type": "module" in package.json. Note: this requires explicit
