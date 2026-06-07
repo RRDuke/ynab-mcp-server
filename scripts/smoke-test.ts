@@ -28,14 +28,35 @@ console.log(
   tools.map((t) => t.name),
 );
 
-// 2. Invoke the tool — the real end-to-end test against YNAB's servers.
-console.log("\nCalling list_budgets...\n");
-const result = await client.callTool({
-  name: "list_budgets",
-  arguments: {},
-});
+// Small helper: call a tool and print the first text block it returns.
+// callTool's result.content is the { type, text }[] array our server built.
+async function callAndPrint(
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<string> {
+  console.log(`\n=== ${name}(${JSON.stringify(args)}) ===`);
+  const result = await client.callTool({ name, arguments: args });
+  const text = (result.content as { type: string; text: string }[])
+    .map((c) => c.text)
+    .join("\n");
+  console.log(text);
+  return text;
+}
 
-// result.content is the { type, text } array our server returned.
-console.log(JSON.stringify(result.content, null, 2));
+// 2. list_budgets (no args) — and scrape the first budget id out of the text
+//    so the argument-taking tools below have a real id to work with.
+const budgetsText = await callAndPrint("list_budgets");
+const budgetId = budgetsText.match(/id: ([0-9a-f-]+)/i)?.[1];
+if (!budgetId) {
+  console.error("\nCould not find a budget id to test the other tools with.");
+  await client.close();
+  process.exit(1);
+}
+console.log(`\n>>> Using budgetId ${budgetId} for the remaining tools.`);
+
+// 3. The three argument-taking read tools, against the real budget.
+await callAndPrint("list_accounts", { budgetId });
+await callAndPrint("list_categories", { budgetId });
+await callAndPrint("list_transactions", { budgetId });
 
 await client.close(); // shuts down the child server process

@@ -124,8 +124,10 @@ server.registerTool(
 // --- 6. Register the read-only "list_categories" tool ----------------------
 // Nested data: YNAB returns category_groups, and each group holds its own
 // categories[]. So we iterate two levels — groups outside, categories inside.
-// We skip hidden/deleted at both levels (YNAB keeps a hidden "Internal Master
-// Category" group for bookkeeping like "Inflow: Ready to Assign").
+// We skip hidden/deleted at both levels. Note: YNAB's bookkeeping group
+// "Internal Master Category" (holding "Inflow: Ready to Assign",
+// "Uncategorized", etc.) is NOT flagged hidden, so it currently shows through.
+// Filter it out by name here if we decide it's noise for the caller.
 server.registerTool(
   "list_categories",
   {
