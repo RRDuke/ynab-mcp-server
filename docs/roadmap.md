@@ -33,15 +33,23 @@ based on what that analysis reveals.
 ### Milestone 4 — Phase 1: review, clean & categorize
 The cleanup workflow over existing transaction data.
 
-**Read enhancements (do first — current tools can't support the workflow):**
-- `list_transactions`: add optional `type` filter — the enum
-  `"uncategorized" | "unapproved"` passed as `getTransactions`' 3rd arg. Lets
-  Claude pull just the rows that need attention.
-- `list_transactions`: client-side pagination. NOTE: YNAB has no server-side
-  offset/limit paging — `getTransactions` returns the entire matching set in
-  one call (only `sinceDate` + a delta cursor exist). So we add `limit` and
-  `offset` inputs, slice the fetched array ourselves, and report the total
-  count and the window shown. Replaces the current fixed 50-row cap.
+**Read enhancements (DONE — commits 0b7e809, d73373b):**
+- `list_transactions` `type` filter — `"uncategorized" | "unapproved"`. Now
+  applied client-side (see cache below): `unapproved` is exact; `uncategorized`
+  is approximated as a row needing a category (no category_id, not a transfer,
+  not a split parent).
+- `list_transactions` `limit`/`offset` pagination via Zod `.default()`, slicing
+  client-side and reporting the window shown out of the matching total.
+- Delta-synced transaction cache (`getAllTransactions`): per-budget cache kept
+  fresh via YNAB's `server_knowledge` cursor. First call fetches the full set;
+  later calls fetch only changes and merge by id. All filters/paging run over
+  this complete local set.
+
+IMPLICATION FOR WRITES: because every read does a cheap delta sync, the cache
+self-heals after our own writes — the next read merges the changes back. So we
+likely do NOT need explicit cache invalidation on write; a write can simply let
+the next read pick up the delta (optionally force `refresh` for read-your-write
+certainty). Confirm this holds once the first write tool exists.
 
 **Write tools:**
 - `update_transaction` — `updateTransaction`; categorize/fix one row.
