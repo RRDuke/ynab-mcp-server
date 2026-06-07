@@ -72,13 +72,26 @@ Reshape the budget structure based on the M4 analysis.
 - `assign_to_category` — `updateMonthCategory`; budget money to a category for
   a given month (the core YNAB action).
 
-## Cross-cutting: safety posture (decide before writing M4)
+## Cross-cutting: safety posture (decided 2026-06-06)
 Bulk writes on real money are the sharp edge — a misfired `update_transactions`
-could mis-categorize hundreds of rows. To settle before Phase 1 code:
-- Dry-run / preview mode for bulk operations?
-- Echo back what was written (ids + before/after) in the tool result?
-- An approval threshold for writes touching more than N rows?
-- How loud the tool descriptions are about being destructive.
+could mis-categorize hundreds of rows. The MCP client already prompts the user
+to approve every tool call; these add protection on top of that:
+
+- **dryRun defaults to TRUE on every bulk write.** The tool resolves names->ids
+  and dollars->milliunits and returns the full planned change WITHOUT writing.
+  Claude must explicitly pass `dryRun: false` to commit. A mistaken call
+  previews instead of mutating.
+- **Per-row before -> after echo-back.** Both the dry-run preview and the
+  committed result list each affected id with old value -> new value, so every
+  change is auditable in the conversation. Preview and commit share one format.
+- **Batch cap with a clear error.** Bulk calls over a limit (start at 100 rows)
+  are rejected with a message telling Claude to split the batch. Bounds blast
+  radius and keeps previews readable. Limit is a single tunable constant.
+- Tool descriptions state plainly that the tool mutates data.
+
+Single-row writes (`update_transaction`, `delete_transaction`) rely on the
+client's per-call approval + echo-back; the dryRun/cap machinery is for the
+bulk tools where blast radius is large.
 
 ## Scope decisions (locked 2026-06-06)
 - M4 and M5 are split (not one big milestone).
