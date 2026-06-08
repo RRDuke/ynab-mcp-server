@@ -47,15 +47,42 @@ The cleanup workflow over existing transaction data.
 
 IMPLICATION FOR WRITES: because every read does a cheap delta sync, the cache
 self-heals after our own writes — the next read merges the changes back. So we
-likely do NOT need explicit cache invalidation on write; a write can simply let
-the next read pick up the delta (optionally force `refresh` for read-your-write
-certainty). Confirm this holds once the first write tool exists.
+do NOT need explicit cache invalidation on write; a write can simply let the
+next read pick up the delta (optionally force `refresh` for read-your-write
+certainty). CONFIRMED 2026-06-07: after `update_transaction` wrote one row, the
+next `list_transactions` logged "delta merged 1 change" — the cache picked up
+our own write with no invalidation.
+
+**`cleared` vs `approved` — two independent flags, don't conflate them:**
+- **`cleared`** (`cleared` | `uncleared` | `reconciled`) is a *bank* fact: has
+  this transaction cleared the financial institution? Bank-linked imports
+  arrive **already `cleared`**, so on this budget `cleared` is NOT a
+  "needs-review" signal — almost everything is already cleared.
+- **`approved`** is a *user* fact: has a human reviewed/vetted this row? Bank
+  imports arrive **`approved = false`** and stay there until the user approves.
+- So the real "needs cleanup" signal here is **`approved = false`** (often paired
+  with uncategorized), NOT uncleared. The cleanup workhorse action is therefore
+  **set `category_id` + set `approved = true`** in one write. `list_transactions`'
+  `type: "unapproved"` filter is the way to surface this queue. (Note YNAB's
+  `type: "uncategorized"` is a separate axis; many rows are both.)
 
 **Write tools:**
-- `update_transaction` — `updateTransaction`; categorize/fix one row.
+- `update_transaction` — `updateTransaction`; categorize/fix one row. **DONE
+  2026-06-07**, verified live (NYT row: uncategorized->Content Subscriptions,
+  approved false->true). Exposes 8 editable fields (categoryId, payeeName, memo,
+  amount [dollars], date, approved, cleared, flagColor); introduces the
+  `dollarsToMilliunits` helper (Math.round for FP safety) and the
+  `{ transaction }` PutTransactionWrapper. Guards: no-op (no fields) and
+  unknown-id both error cleanly; echoes each changed field old->new. Also drove
+  the read tools to surface ids (txn/category/account) so Claude can hand
+  read-output ids to the write tools.
 - `update_transactions` (bulk) — `updateTransactions` with
   `{ transactions: [{ id, category_id, ... }] }`. The cleanup workhorse:
-  categorize many rows in one call. Every field but `id` is optional.
+  categorize + approve many rows in one call (see `cleared` vs `approved` above —
+  the action is set category + `approved: true`). Every field but `id` is
+  optional. First tool to carry the dryRun/echo-back/batch-cap safety machinery.
+  Natural first target: the ~13 remaining uncategorized "New York Times" rows. ←
+  *next*
 - `create_transaction` — `createTransaction`. Supports BOTH single and bulk:
   the `PostTransactionsWrapper` takes `transaction` OR `transactions[]`, so one
   tool can add a row or import a batch (e.g. missing history from a statement).

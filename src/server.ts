@@ -56,6 +56,16 @@ function formatMilliunits(milliunits: number): string {
   }).format(milliunits / 1000);
 }
 
+// The inverse of formatMilliunits, for the WRITE path: Claude thinks in dollars
+// (43.21), YNAB stores integer milliunits (43210). Multiplying by 1000 isn't
+// enough — binary floating point can't represent 43.21 exactly, so
+// 43.21 * 1000 === 43209.99999999999, not 43210. Math.round snaps to the
+// nearest whole milliunit, which is what YNAB requires. Negative amounts
+// (outflows) round correctly too: Math.round(-43209.9999) === -43210.
+function dollarsToMilliunits(dollars: number): number {
+  return Math.round(dollars * 1000);
+}
+
 // --- 4. Register the read-only "list_budgets" tool -------------------------
 // (A) name + config = the Claude-facing interface. The description is how
 //     Claude decides WHEN to call this tool, so it's worth writing clearly.
@@ -110,7 +120,10 @@ server.registerTool(
     const accounts = response.data.accounts.filter((a) => !a.closed);
 
     const lines = accounts
-      .map((a) => `- ${a.name} [${a.type}]: ${formatMilliunits(a.balance)}`)
+      .map(
+        (a) =>
+          `- ${a.name} [${a.type}]: ${formatMilliunits(a.balance)} (id: ${a.id})`,
+      )
       .join("\n");
     const text =
       accounts.length > 0
@@ -160,7 +173,7 @@ server.registerTool(
         const catLines = categories
           .map(
             (c) =>
-              `  - ${c.name}: budgeted ${formatMilliunits(c.budgeted)}, ` +
+              `  - ${c.name} (id: ${c.id}): budgeted ${formatMilliunits(c.budgeted)}, ` +
               `activity ${formatMilliunits(c.activity)}, ` +
               `balance ${formatMilliunits(c.balance)}`,
           )
@@ -328,7 +341,7 @@ server.registerTool(
         const category = t.category_name ?? "(uncategorized)";
         return (
           `- ${t.date} | ${payee} | ${category} | ` +
-          `${formatMilliunits(t.amount)} [${t.account_name}]`
+          `${formatMilliunits(t.amount)} [${t.account_name}] (id: ${t.id})`
         );
       })
       .join("\n");
@@ -357,7 +370,178 @@ server.registerTool(
   },
 );
 
-// --- 8. Connect over stdio and start serving -------------------------------
+// --- 8. Register the write tool "update_transaction" -----------------------
+// Our FIRST tool that MUTATES data. It edits one existing transaction — the
+// core of the cleanup workflow (categorize a row, then "clear" it to mark it
+// vetted). Every editable field is optional; you send only what you're
+// changing. The write goes through updateTransaction(budgetId, txnId, body),
+// where `body` is the PutTransactionWrapper: YNAB wants the fields nested under
+// a `transaction:` key, not passed loose. The MCP client prompts you to
+// approve every call, and we echo each changed field old -> new so the edit is
+// auditable in the conversation.
+server.registerTool(
+  "update_transaction",
+  {
+    title: "Update a single YNAB transaction",
+    description:
+      "Edit one existing transaction in a YNAB budget — typically to assign a " +
+      "category and then mark it cleared once vetted. Provide budgetId and " +
+      "transactionId to locate the row, plus any fields to change; omitted " +
+      "fields are left as-is. Amount is in dollars (e.g. -43.21 for a $43.21 " +
+      "outflow). MUTATES data. Use list_transactions to find the transactionId " +
+      "and list_categories to find a categoryId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget containing the transaction."),
+      transactionId: z
+        .string()
+        .describe("The id of the transaction to update."),
+      categoryId: z
+        .string()
+        .optional()
+        .describe(
+          "Assign this category (a category id from list_categories). " +
+            "Cannot be changed on a split transaction.",
+        ),
+      payeeName: z
+        .string()
+        .optional()
+        .describe(
+          "Set the payee name. Resolves to an existing payee or creates one.",
+        ),
+      memo: z.string().optional().describe("Set the transaction memo/note."),
+      amount: z
+        .number()
+        .optional()
+        .describe(
+          "Set the amount in DOLLARS (negative for outflow, e.g. -43.21). " +
+            "Converted to YNAB milliunits internally.",
+        ),
+      date: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO format YYYY-MM-DD")
+        .optional()
+        .describe("Set the transaction date (YYYY-MM-DD). No future dates."),
+      approved: z
+        .boolean()
+        .optional()
+        .describe("Mark the transaction approved (true) or unapproved (false)."),
+      cleared: z
+        .enum(["cleared", "uncleared", "reconciled"])
+        .optional()
+        .describe(
+          "Set the cleared status. Mark 'cleared' once a transaction has been " +
+            "vetted and needs no further review.",
+        ),
+      flagColor: z
+        .enum(["red", "orange", "yellow", "green", "blue", "purple"])
+        .optional()
+        .describe("Set the flag color (e.g. to mark a row during review)."),
+    },
+  },
+  async ({
+    budgetId,
+    transactionId,
+    categoryId,
+    payeeName,
+    memo,
+    amount,
+    date,
+    approved,
+    cleared,
+    flagColor,
+  }) => {
+    // (1) Build the partial update from ONLY the fields the caller supplied.
+    // Each `!== undefined` check means an omitted arg leaves that field
+    // untouched on YNAB's side. amount is the one conversion: dollars -> the
+    // integer milliunits YNAB stores.
+    const transaction: ynab.ExistingTransaction = {};
+    if (categoryId !== undefined) transaction.category_id = categoryId;
+    if (payeeName !== undefined) transaction.payee_name = payeeName;
+    if (memo !== undefined) transaction.memo = memo;
+    if (amount !== undefined) transaction.amount = dollarsToMilliunits(amount);
+    if (date !== undefined) transaction.date = date;
+    if (approved !== undefined) transaction.approved = approved;
+    if (cleared !== undefined) transaction.cleared = cleared;
+    if (flagColor !== undefined) transaction.flag_color = flagColor;
+
+    // (2) Guard: refuse a no-op so we don't make a pointless write call.
+    if (Object.keys(transaction).length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "No fields to update. Supply at least one of: categoryId, " +
+              "payeeName, memo, amount, date, approved, cleared, flagColor.",
+          },
+        ],
+      };
+    }
+
+    // (3) Capture the BEFORE state for echo-back, from the delta-synced cache.
+    // If the id isn't in the budget, fail early — a wrong id is a likely slip.
+    const all = await getAllTransactions(budgetId, false);
+    const before = all.find((t) => t.id === transactionId);
+    if (!before) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No transaction with id ${transactionId} found in budget ${budgetId}.`,
+          },
+        ],
+      };
+    }
+
+    // (4) Write. The PutTransactionWrapper is the { transaction } envelope.
+    const response = await ynabAPI.transactions.updateTransaction(
+      budgetId,
+      transactionId,
+      { transaction },
+    );
+    const after = response.data.transaction;
+
+    // (5) Echo back each changed field old -> new. We use the API's response
+    // as the authoritative "after" (YNAB resolves names, applies its rules).
+    // Only fields the caller actually passed are listed.
+    const changes: string[] = [];
+    if (categoryId !== undefined)
+      changes.push(
+        `  category: ${before.category_name ?? "(uncategorized)"} -> ${after.category_name ?? "(uncategorized)"}`,
+      );
+    if (payeeName !== undefined)
+      changes.push(
+        `  payee: ${before.payee_name ?? "(none)"} -> ${after.payee_name ?? "(none)"}`,
+      );
+    if (memo !== undefined)
+      changes.push(`  memo: ${before.memo ?? "(none)"} -> ${after.memo ?? "(none)"}`);
+    if (amount !== undefined)
+      changes.push(
+        `  amount: ${formatMilliunits(before.amount)} -> ${formatMilliunits(after.amount)}`,
+      );
+    if (date !== undefined) changes.push(`  date: ${before.date} -> ${after.date}`);
+    if (approved !== undefined)
+      changes.push(`  approved: ${before.approved} -> ${after.approved}`);
+    if (cleared !== undefined)
+      changes.push(`  cleared: ${before.cleared} -> ${after.cleared}`);
+    if (flagColor !== undefined)
+      changes.push(
+        `  flag: ${before.flag_color ?? "(none)"} -> ${after.flag_color ?? "(none)"}`,
+      );
+
+    const header =
+      `Updated transaction ${after.id}:\n` +
+      `  ${after.date} | ${after.payee_name ?? "(no payee)"} | ` +
+      `${formatMilliunits(after.amount)} [${after.account_name}]`;
+    const text = `${header}\n${changes.join("\n")}`;
+
+    return { content: [{ type: "text", text }] };
+  },
+);
+
+// --- 9. Connect over stdio and start serving -------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.
