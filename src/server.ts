@@ -1106,7 +1106,64 @@ server.registerTool(
   },
 );
 
-// --- 11. Connect over stdio and start serving ------------------------------
+// --- 11. Register the write tool "delete_transaction" ----------------------
+// Removes one transaction — for clearing out duplicates and junk rows (and for
+// undoing a create_transactions test row). Single-row, like update_transaction:
+// it relies on the MCP client's per-call approval rather than dryRun. We capture
+// the row's details from the cache BEFORE deleting so the echo-back can report
+// exactly what was removed, and fail cleanly if the id isn't in the budget.
+// deleteTransaction returns the deleted row in data.transaction (deleted: true).
+server.registerTool(
+  "delete_transaction",
+  {
+    title: "Delete a single YNAB transaction",
+    description:
+      "Permanently delete one transaction from a YNAB budget — typically to " +
+      "remove a duplicate or junk row. Provide budgetId and transactionId. " +
+      "MUTATES data (deletes). Use list_transactions to find the transactionId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget containing the transaction."),
+      transactionId: z
+        .string()
+        .describe("The id of the transaction to delete."),
+    },
+  },
+  async ({ budgetId, transactionId }) => {
+    // Capture the BEFORE state for the echo-back. If the id isn't in the budget,
+    // fail early — a wrong id is a likely slip, and there's nothing to delete.
+    const all = await getAllTransactions(budgetId, false);
+    const before = all.find((t) => t.id === transactionId);
+    if (!before) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No transaction with id ${transactionId} found in budget ${budgetId}.`,
+          },
+        ],
+      };
+    }
+
+    await ynabAPI.transactions.deleteTransaction(budgetId, transactionId);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Deleted transaction ${before.id}:\n` +
+            `  ${before.date} | ${before.payee_name ?? "(no payee)"} | ` +
+            `${before.category_name ?? "(uncategorized)"} | ` +
+            `${formatMilliunits(before.amount)} [${before.account_name}]`,
+        },
+      ],
+    };
+  },
+);
+
+// --- 12. Connect over stdio and start serving ------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.

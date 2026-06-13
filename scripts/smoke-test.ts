@@ -105,4 +105,12 @@ if (accountId) {
   });
 }
 
+// 6. delete_transaction — exercise the not-found guard with a bogus id. This is
+//    SAFE (deletes nothing); the real create -> delete round trip is verified
+//    out-of-band with a throwaway when needed, since delete has no dryRun.
+await callAndPrint("delete_transaction", {
+  budgetId,
+  transactionId: "00000000-0000-0000-0000-000000000000",
+});
+
 await client.close(); // shuts down the child server process

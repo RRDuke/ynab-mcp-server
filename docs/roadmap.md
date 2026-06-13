@@ -147,7 +147,19 @@ our own write with no invalidation.
     response's `duplicate_import_ids`). We intentionally left `import_id` OUT of
     the first version and will add it when building the **backfill (step 6)**,
     where idempotent, re-runnable imports actually matter. ← *add import_id here*
-- `delete_transaction` — `deleteTransaction`; remove dupes/junk. ← *next tool*
+- `delete_transaction` — `deleteTransaction`; remove dupes/junk. **DONE
+  2026-06-12.** Single-row (no dryRun — relies on the client's per-call approval,
+  like `update_transaction`): captures the row from the cache BEFORE deleting so
+  the echo-back reports what was removed, and fails cleanly on an unknown id.
+  Verified live with a full **create -> delete round trip** (created a real test
+  row, deleted it, confirmed gone via a forced-refresh read — no residue). Smoke
+  test exercises the not-found guard only (delete has no dryRun).
+
+**✅ Milestone 4 write tools COMPLETE (2026-06-12):** `update_transaction`,
+`update_transactions`, `create_transactions`, `delete_transaction` all built and
+verified live. The cleanup workflow now has its full toolset. Remaining M4 work
+is using them (categorize the ~1.3k uncategorized backlog) + the Amazon
+disambiguation study (program step 2).
 
 **New concepts introduced here:**
 - Nested request-body wrappers: inputSchema grows from flat fields to nested
