@@ -867,7 +867,246 @@ server.registerTool(
   },
 );
 
-// --- 10. Connect over stdio and start serving ------------------------------
+// --- 10. Register the "create_transactions" tool ---------------------------
+// Adds brand-new transactions (single or many) via createTransaction's
+// { transactions } form. Central to the migration plan: it's how we'll backfill
+// a fresh plan from cleaned historical data. Same safety shape as
+// update_transactions (dryRun default true + batch cap), but there's no "before"
+// state — rows don't exist yet — so the preview renders the rows we'd CREATE.
+// We start with just the skeleton (budgetId + dryRun); the rest is built below.
+// A budget's account ids -> names (non-deleted), to validate accountId and make
+// the preview readable. Parallels getCategoryNameMap.
+async function getAccountNameMap(
+  budgetId: string,
+): Promise<Map<string, string>> {
+  const response = await ynabAPI.accounts.getAccounts(budgetId);
+  const map = new Map<string, string>();
+  for (const a of response.data.accounts) {
+    if (!a.deleted) map.set(a.id, a.name);
+  }
+  return map;
+}
+
+// The shape of one input row after Zod parsing. Unlike the update rows, the
+// three fields YNAB requires to create a transaction — accountId, date, amount —
+// are mandatory; the rest are optional.
+type NewRow = {
+  accountId: string;
+  date: string;
+  amount: number;
+  payeeName?: string;
+  categoryId?: string;
+  memo?: string;
+  approved?: boolean;
+  cleared?: "cleared" | "uncleared" | "reconciled";
+  flagColor?: "red" | "orange" | "yellow" | "green" | "blue" | "purple";
+};
+
+// Render a row we WOULD create (preview): a one-line summary plus indented
+// detail lines for any optional fields that were set.
+function describeNewRow(
+  row: NewRow,
+  accountName: string,
+  categoryName: string | undefined,
+): string {
+  const header =
+    `  ${row.date} | ${row.payeeName ?? "(no payee)"} | ` +
+    `${categoryName ?? "(uncategorized)"} | ` +
+    `${formatMilliunits(dollarsToMilliunits(row.amount))} [${accountName}]`;
+  const extra: string[] = [];
+  if (row.memo !== undefined) extra.push(`    memo: ${row.memo}`);
+  if (row.approved !== undefined) extra.push(`    approved: ${row.approved}`);
+  if (row.cleared !== undefined) extra.push(`    cleared: ${row.cleared}`);
+  if (row.flagColor !== undefined) extra.push(`    flag: ${row.flagColor}`);
+  return extra.length > 0 ? `${header}\n${extra.join("\n")}` : header;
+}
+
+server.registerTool(
+  "create_transactions",
+  {
+    title: "Create new YNAB transactions (single or bulk)",
+    description:
+      "Add one or more brand-new transactions to a budget. Each row REQUIRES " +
+      "accountId, date (YYYY-MM-DD), and amount (in dollars, negative for an " +
+      "outflow); payeeName, categoryId, memo, approved, cleared, and flagColor " +
+      "are optional. MUTATES data, but dryRun defaults to TRUE: the call " +
+      `previews the rows it would create without writing — pass dryRun:false to ` +
+      `commit. Up to ${MAX_BULK_TRANSACTIONS} rows per call. Use list_accounts ` +
+      "for accountId and list_categories for categoryId.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget to add transactions to."),
+      transactions: z
+        .array(
+          z.object({
+            accountId: z
+              .string()
+              .describe("The account to add the transaction to (required)."),
+            date: z
+              .string()
+              .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO YYYY-MM-DD")
+              .describe("The transaction date, YYYY-MM-DD (required)."),
+            amount: z
+              .number()
+              .describe(
+                "The amount in DOLLARS, negative for an outflow (required).",
+              ),
+            payeeName: z
+              .string()
+              .optional()
+              .describe("Payee name (resolves or creates a payee)."),
+            categoryId: z
+              .string()
+              .optional()
+              .describe("Category id (from list_categories)."),
+            memo: z.string().optional().describe("Memo/note."),
+            approved: z
+              .boolean()
+              .optional()
+              .describe("Mark approved. Defaults to unapproved if omitted."),
+            cleared: z
+              .enum(["cleared", "uncleared", "reconciled"])
+              .optional()
+              .describe("Cleared status. Defaults to uncleared if omitted."),
+            flagColor: z
+              .enum(["red", "orange", "yellow", "green", "blue", "purple"])
+              .optional()
+              .describe("Flag color."),
+          }),
+        )
+        .min(1)
+        .describe("The transactions to create; one entry per row."),
+      dryRun: z
+        .boolean()
+        .default(true)
+        .describe(
+          "When true (the default) PREVIEW the rows without writing. Pass " +
+            "false to actually create them.",
+        ),
+    },
+  },
+  async ({ budgetId, transactions, dryRun }) => {
+    // (1) Batch cap — reject oversized calls before doing any work.
+    if (transactions.length > MAX_BULK_TRANSACTIONS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Too many rows (${transactions.length}). The bulk cap is ` +
+              `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
+              "and retry.",
+          },
+        ],
+      };
+    }
+
+    // (2) Resolve account + category names: used both to VALIDATE the ids the
+    // caller passed and to render a readable preview.
+    const accountNames = await getAccountNameMap(budgetId);
+    const categoryNames = await getCategoryNameMap(budgetId);
+
+    // (3) Validate ids up front; abort the WHOLE batch if any are unknown (a
+    // bad account/category id is a likely slip — fail before creating anything).
+    const badAccounts = new Set<string>();
+    const badCategories = new Set<string>();
+    for (const row of transactions) {
+      if (!accountNames.has(row.accountId)) badAccounts.add(row.accountId);
+      if (row.categoryId !== undefined && !categoryNames.has(row.categoryId))
+        badCategories.add(row.categoryId);
+    }
+    if (badAccounts.size > 0 || badCategories.size > 0) {
+      const problems = [
+        ...[...badAccounts].map((id) => `  - unknown accountId: ${id}`),
+        ...[...badCategories].map((id) => `  - unknown categoryId: ${id}`),
+      ];
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Aborted — nothing created. Unknown id(s) in budget ${budgetId}:\n` +
+              problems.join("\n") +
+              "\nUse list_accounts / list_categories to get valid ids.",
+          },
+        ],
+      };
+    }
+
+    // (4) Build the preview from the (now validated) rows.
+    const previewBlocks = transactions.map((row) =>
+      describeNewRow(
+        row,
+        accountNames.get(row.accountId)!,
+        row.categoryId ? categoryNames.get(row.categoryId) : undefined,
+      ),
+    );
+    const body = previewBlocks.join("\n");
+
+    // (5) Dry run stops here: validated and previewed, but nothing written.
+    if (dryRun) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `DRY RUN — nothing was created. ${transactions.length} ` +
+              `transaction(s) would be added to budget ${budgetId}:\n${body}\n\n` +
+              "Re-run with dryRun:false to create them.",
+          },
+        ],
+      };
+    }
+
+    // (6) COMMIT. Map each row to a NewTransaction (dollars -> milliunits, only
+    // the fields that were set), then post the whole batch in one call.
+    const payload: ynab.PostTransactionsWrapper = {
+      transactions: transactions.map((row) => {
+        const t: ynab.NewTransaction = {
+          account_id: row.accountId,
+          date: row.date,
+          amount: dollarsToMilliunits(row.amount),
+        };
+        if (row.payeeName !== undefined) t.payee_name = row.payeeName;
+        if (row.categoryId !== undefined) t.category_id = row.categoryId;
+        if (row.memo !== undefined) t.memo = row.memo;
+        if (row.approved !== undefined) t.approved = row.approved;
+        if (row.cleared !== undefined) t.cleared = row.cleared;
+        if (row.flagColor !== undefined) t.flag_color = row.flagColor;
+        return t;
+      }),
+    };
+
+    const response = await ynabAPI.transactions.createTransaction(
+      budgetId,
+      payload,
+    );
+    const created = response.data.transactions ?? [];
+
+    // (7) Echo back each created row WITH its new id (YNAB's authoritative
+    // resolved values).
+    const resultBlocks = created.map(
+      (t) =>
+        `  ${t.date} | ${t.payee_name ?? "(no payee)"} | ` +
+        `${t.category_name ?? "(uncategorized)"} | ` +
+        `${formatMilliunits(t.amount)} [${t.account_name}] (id: ${t.id})`,
+    );
+
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Created ${created.length} transaction(s) in budget ${budgetId}:\n` +
+            resultBlocks.join("\n"),
+        },
+      ],
+    };
+  },
+);
+
+// --- 11. Connect over stdio and start serving ------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.

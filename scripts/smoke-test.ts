@@ -55,7 +55,7 @@ if (!budgetId) {
 console.log(`\n>>> Using budgetId ${budgetId} for the remaining tools.`);
 
 // 3. The argument-taking read tools, against the real budget.
-await callAndPrint("list_accounts", { budgetId });
+const accountsText = await callAndPrint("list_accounts", { budgetId });
 await callAndPrint("list_categories", { budgetId });
 
 // list_transactions: exercise delta caching + paging + the type filter.
@@ -83,6 +83,25 @@ if (txnId && categoryId) {
     budgetId,
     transactions: [{ transactionId: txnId, categoryId, approved: true }],
     // dryRun omitted -> defaults to true -> previews, never writes.
+  });
+}
+
+// 5. create_transactions — DRY RUN ONLY. Scrape a real accountId and preview
+//    adding one row. dryRun defaults to true, so nothing is created. (No
+//    import_id yet — dedup is deferred to the backfill step; see roadmap.)
+const accountId = accountsText.match(/\(id: ([0-9a-f-]+)\)/i)?.[1];
+if (accountId) {
+  await callAndPrint("create_transactions", {
+    budgetId,
+    transactions: [
+      {
+        accountId,
+        date: "2026-06-01",
+        amount: -1.23,
+        payeeName: "Smoke Test",
+        memo: "dry-run only",
+      },
+    ],
   });
 }
 

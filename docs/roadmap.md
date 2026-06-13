@@ -130,11 +130,24 @@ our own write with no invalidation.
   switches the "new" value from caller-intended to YNAB-authoritative). Guards:
   batch cap (`MAX_BULK_TRANSACTIONS = 100`), and unknown-id / no-op rows abort the
   WHOLE batch (no partial writes). Smoke test exercises it in dry-run only.
-- `create_transaction` — `createTransaction`. Supports BOTH single and bulk:
-  the `PostTransactionsWrapper` takes `transaction` OR `transactions[]`, so one
-  tool can add a row or import a batch (e.g. missing history from a statement). ←
-  *next*
-- `delete_transaction` — `deleteTransaction`; remove dupes/junk.
+- `create_transactions` — `createTransaction` via the `{ transactions }` form.
+  **DONE 2026-06-12** (renamed plural; one array-based tool handles single + bulk,
+  mirroring `update_transactions`). Each row REQUIRES accountId + date + amount
+  (dollars); payee/category/memo/approved/cleared/flag optional. Same safety
+  shape: dryRun default true, batch cap, and unknown accountId/categoryId aborts
+  the whole batch. No "before" state, so the preview renders the rows it WOULD
+  create (resolved account+category names) and the commit echoes the new ids.
+  Added `getAccountNameMap` helper. Verified live: dry-run preview + unknown-id
+  abort (no real write — we have no delete tool yet to undo a test row). Smoke
+  test exercises it in dry-run only.
+  - ⚠️ **DEDUP DEFERRED (decided 2026-06-12, Rob — option A):** YNAB does NO
+    content-based dedup on create — re-posting the same row makes a DUPLICATE.
+    The native guard is `import_id` (unique per account; YNAB convention
+    `YNAB:<amount_milliunits>:<date>:<occurrence>`; collisions come back in the
+    response's `duplicate_import_ids`). We intentionally left `import_id` OUT of
+    the first version and will add it when building the **backfill (step 6)**,
+    where idempotent, re-runnable imports actually matter. ← *add import_id here*
+- `delete_transaction` — `deleteTransaction`; remove dupes/junk. ← *next tool*
 
 **New concepts introduced here:**
 - Nested request-body wrappers: inputSchema grows from flat fields to nested
