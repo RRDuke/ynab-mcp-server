@@ -81,11 +81,18 @@ our own write with no invalidation.
   categorize + approve many rows in one call (see `cleared` vs `approved` above —
   the action is set category + `approved: true`). Every field but `id` is
   optional. First tool to carry the dryRun/echo-back/batch-cap safety machinery.
-  Natural first target: the ~13 remaining uncategorized "New York Times" rows. ←
-  *next*
+  **DONE 2026-06-12**, verified live: categorized all 12 uncategorized "The New
+  York Times" rows ($18/mo subscription on Jen Freedom New) -> Content
+  Subscriptions + approved, then a fresh read confirmed 0 remain (read-your-write
+  via the delta cache). Mirrors the single tool's field mapping per row; shares
+  the `describeRowChanges` formatter between preview and commit (the `after` arg
+  switches the "new" value from caller-intended to YNAB-authoritative). Guards:
+  batch cap (`MAX_BULK_TRANSACTIONS = 100`), and unknown-id / no-op rows abort the
+  WHOLE batch (no partial writes). Smoke test exercises it in dry-run only.
 - `create_transaction` — `createTransaction`. Supports BOTH single and bulk:
   the `PostTransactionsWrapper` takes `transaction` OR `transactions[]`, so one
-  tool can add a row or import a batch (e.g. missing history from a statement).
+  tool can add a row or import a batch (e.g. missing history from a statement). ←
+  *next*
 - `delete_transaction` — `deleteTransaction`; remove dupes/junk.
 
 **New concepts introduced here:**
@@ -108,9 +115,19 @@ Reshape the budget structure based on the M4 analysis.
   a given month (the core YNAB action).
 
 ## Cross-cutting: safety posture (decided 2026-06-06)
-Bulk writes on real money are the sharp edge — a misfired `update_transactions`
-could mis-categorize hundreds of rows. The MCP client already prompts the user
-to approve every tool call; these add protection on top of that:
+**Blast radius is bounded (clarified 2026-06-12).** YNAB is a budget *tracking*
+application — these tools mutate the budget's bookkeeping records (categories,
+approved/cleared flags, memos), NOT actual money. Nothing here can move funds,
+pay a bill, or touch a real bank account. The worst case of a misfired write is
+corrupted *tracking* data, and even that is recoverable: re-download the
+transaction data from the linked banks and start over. So the safety machinery
+below is about keeping the bookkeeping clean and the conversation auditable, NOT
+about preventing financial loss — there is no financial loss to prevent.
+
+With that framing, a misfired `update_transactions` could still mis-categorize
+hundreds of rows (annoying to untangle), so the guards remain worthwhile. The
+MCP client already prompts the user to approve every tool call; these add
+protection on top of that:
 
 - **dryRun defaults to TRUE on every bulk write.** The tool resolves names->ids
   and dollars->milliunits and returns the full planned change WITHOUT writing.

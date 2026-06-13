@@ -64,10 +64,26 @@ await callAndPrint("list_transactions", { budgetId, limit: 3 });
 // Second call = cheap delta reuse ("[cache] ... delta merged"), page 2.
 await callAndPrint("list_transactions", { budgetId, limit: 3, offset: 3 });
 // Type filter: only rows still needing a category.
-await callAndPrint("list_transactions", {
+const uncategorizedText = await callAndPrint("list_transactions", {
   budgetId,
   type: "uncategorized",
   limit: 5,
 });
+
+// 4. update_transactions — DRY RUN ONLY (never writes from the smoke test).
+//    Scrape one real transaction id and preview a categorize+approve change.
+//    dryRun defaults to true, so this exercises the validate + preview path
+//    end to end without mutating anything.
+const txnId = uncategorizedText.match(/\(id: ([0-9a-f-]+)\)/i)?.[1];
+const categoryId = (
+  await callAndPrint("list_categories", { budgetId })
+).match(/\(id: ([0-9a-f-]+)\)/i)?.[1];
+if (txnId && categoryId) {
+  await callAndPrint("update_transactions", {
+    budgetId,
+    transactions: [{ transactionId: txnId, categoryId, approved: true }],
+    // dryRun omitted -> defaults to true -> previews, never writes.
+  });
+}
 
 await client.close(); // shuts down the child server process

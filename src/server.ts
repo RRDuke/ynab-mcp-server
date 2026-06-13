@@ -541,7 +541,333 @@ server.registerTool(
   },
 );
 
-// --- 9. Connect over stdio and start serving -------------------------------
+// --- 9. Register the BULK write tool "update_transactions" -----------------
+// The cleanup workhorse: edit many transactions in one call. This is our first
+// tool with the bulk-write safety machinery, and the headline piece of that is
+// `dryRun`: it defaults to TRUE, so the tool PREVIEWS the planned change and
+// writes nothing unless the caller explicitly passes dryRun:false. We start
+// with just the skeleton (budgetId + dryRun); the rest is built up below.
+//
+// Batch cap: reject calls over this many rows. Bounds the blast radius of a
+// misfired bulk write and keeps the preview readable. A single tunable constant.
+const MAX_BULK_TRANSACTIONS = 100;
+
+// The shape of one input row after Zod parsing (the single-tool fields, plus the
+// transactionId that locates the row).
+type BulkRow = {
+  transactionId: string;
+  categoryId?: string;
+  payeeName?: string;
+  memo?: string;
+  amount?: number;
+  date?: string;
+  approved?: boolean;
+  cleared?: "cleared" | "uncleared" | "reconciled";
+  flagColor?: "red" | "orange" | "yellow" | "green" | "blue" | "purple";
+};
+
+// The SHARED before->after formatter, used by both the dry-run preview and the
+// committed result so the two read identically. Lists only the fields this row
+// changes. The "new" value comes from `after` (YNAB's authoritative response)
+// when committing, or from the caller's intended input when previewing — and
+// since a preview only has the raw categoryId, the call site resolves its name
+// and passes it in as `intendedCategoryName`.
+function describeRowChanges(
+  before: ynab.TransactionDetail,
+  row: BulkRow,
+  intendedCategoryName: string | undefined,
+  after?: ynab.TransactionDetail,
+): string[] {
+  const lines: string[] = [];
+  if (row.categoryId !== undefined)
+    lines.push(
+      `    category: ${before.category_name ?? "(uncategorized)"} -> ${
+        after
+          ? (after.category_name ?? "(uncategorized)")
+          : (intendedCategoryName ?? "(unknown category id)")
+      }`,
+    );
+  if (row.payeeName !== undefined)
+    lines.push(
+      `    payee: ${before.payee_name ?? "(none)"} -> ${after ? (after.payee_name ?? "(none)") : row.payeeName}`,
+    );
+  if (row.memo !== undefined)
+    lines.push(
+      `    memo: ${before.memo ?? "(none)"} -> ${after ? (after.memo ?? "(none)") : row.memo}`,
+    );
+  if (row.amount !== undefined)
+    lines.push(
+      `    amount: ${formatMilliunits(before.amount)} -> ${formatMilliunits(
+        after ? after.amount : dollarsToMilliunits(row.amount),
+      )}`,
+    );
+  if (row.date !== undefined)
+    lines.push(`    date: ${before.date} -> ${after ? after.date : row.date}`);
+  if (row.approved !== undefined)
+    lines.push(
+      `    approved: ${before.approved} -> ${after ? after.approved : row.approved}`,
+    );
+  if (row.cleared !== undefined)
+    lines.push(
+      `    cleared: ${before.cleared} -> ${after ? after.cleared : row.cleared}`,
+    );
+  if (row.flagColor !== undefined)
+    lines.push(
+      `    flag: ${before.flag_color ?? "(none)"} -> ${after ? (after.flag_color ?? "(none)") : row.flagColor}`,
+    );
+  return lines;
+}
+
+// One transaction's one-line descriptor, used as the header above its change
+// lines in the preview/echo-back.
+function rowHeader(t: ynab.TransactionDetail): string {
+  return (
+    `${t.date} | ${t.payee_name ?? "(no payee)"} | ` +
+    `${formatMilliunits(t.amount)} [${t.account_name}] (id: ${t.id})`
+  );
+}
+
+// A budget's category ids -> names, flattened from the grouped getCategories
+// shape. Lets the dry-run preview show a category NAME for the id the caller
+// passed (e.g. "uncategorized -> Content Subscriptions") instead of a raw id.
+async function getCategoryNameMap(
+  budgetId: string,
+): Promise<Map<string, string>> {
+  const response = await ynabAPI.categories.getCategories(budgetId);
+  const map = new Map<string, string>();
+  for (const group of response.data.category_groups) {
+    for (const c of group.categories) map.set(c.id, c.name);
+  }
+  return map;
+}
+
+server.registerTool(
+  "update_transactions",
+  {
+    title: "Update multiple YNAB transactions (bulk)",
+    description:
+      "Edit many existing transactions in one call. MUTATES data, but dryRun " +
+      "defaults to TRUE: the call previews the planned change without writing " +
+      "— pass dryRun:false to commit.",
+    inputSchema: {
+      budgetId: z
+        .string()
+        .describe("The id of the budget containing the transactions."),
+      // Unlike the top-level inputSchema (a raw shape — a bare object of
+      // validators), each ARRAY ELEMENT is a full z.object(...). Every row
+      // carries a transactionId to locate it, plus any of the same editable
+      // fields the single update_transaction tool exposes (all optional —
+      // send only what you're changing).
+      transactions: z
+        .array(
+          z.object({
+            transactionId: z
+              .string()
+              .describe("The id of the transaction to update."),
+            categoryId: z
+              .string()
+              .optional()
+              .describe("Assign this category id (from list_categories)."),
+            payeeName: z
+              .string()
+              .optional()
+              .describe("Set the payee name (resolves or creates a payee)."),
+            memo: z.string().optional().describe("Set the memo/note."),
+            amount: z
+              .number()
+              .optional()
+              .describe(
+                "Set the amount in DOLLARS (negative for outflow, e.g. -43.21).",
+              ),
+            date: z
+              .string()
+              .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO YYYY-MM-DD")
+              .optional()
+              .describe("Set the date (YYYY-MM-DD). No future dates."),
+            approved: z
+              .boolean()
+              .optional()
+              .describe("Mark approved (true) or unapproved (false)."),
+            cleared: z
+              .enum(["cleared", "uncleared", "reconciled"])
+              .optional()
+              .describe("Set the cleared status."),
+            flagColor: z
+              .enum(["red", "orange", "yellow", "green", "blue", "purple"])
+              .optional()
+              .describe("Set the flag color."),
+          }),
+        )
+        .min(1)
+        .describe("The transactions to update; one entry per row."),
+      dryRun: z
+        .boolean()
+        .default(true)
+        .describe(
+          "When true (the default) PREVIEW the change without writing. Pass " +
+            "false to actually commit the update.",
+        ),
+    },
+  },
+  async ({ budgetId, transactions, dryRun }) => {
+    // (1) Batch cap — reject oversized calls before doing any work.
+    if (transactions.length > MAX_BULK_TRANSACTIONS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Too many rows (${transactions.length}). The bulk cap is ` +
+              `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
+              "and retry.",
+          },
+        ],
+      };
+    }
+
+    // (2) Resolve current state (delta-synced cache) + category names, so we
+    // can validate ids now and render a readable preview shortly.
+    const all = await getAllTransactions(budgetId, false);
+    const byId = new Map(all.map((t) => [t.id, t]));
+    const categoryNames = await getCategoryNameMap(budgetId);
+
+    // (3) Validate every row up front. Collect problems and abort the WHOLE
+    // batch if any row is bad — never a partial write.
+    const unknownIds: string[] = [];
+    const noopIds: string[] = [];
+    const planned: { before: ynab.TransactionDetail; row: BulkRow }[] = [];
+    for (const row of transactions) {
+      const before = byId.get(row.transactionId);
+      if (!before) {
+        unknownIds.push(row.transactionId);
+        continue;
+      }
+      // A row that changes nothing produces zero change lines — reject it.
+      const changeCount = describeRowChanges(
+        before,
+        row,
+        categoryNames.get(row.categoryId ?? ""),
+      ).length;
+      if (changeCount === 0) {
+        noopIds.push(row.transactionId);
+        continue;
+      }
+      planned.push({ before, row });
+    }
+
+    if (unknownIds.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Aborted — nothing written. These transactionId(s) were not " +
+              `found in budget ${budgetId}:\n` +
+              unknownIds.map((id) => `  - ${id}`).join("\n") +
+              "\nFix or remove them and retry.",
+          },
+        ],
+      };
+    }
+    if (noopIds.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Aborted — nothing written. These row(s) have no fields to " +
+              "change (only a transactionId):\n" +
+              noopIds.map((id) => `  - ${id}`).join("\n") +
+              "\nGive each row at least one field besides transactionId.",
+          },
+        ],
+      };
+    }
+
+    // (4) Build the per-row preview with the SHARED formatter (no `after` arg,
+    // so it renders the caller's intended values).
+    const previewBlocks = planned.map(({ before, row }) => {
+      const lines = describeRowChanges(
+        before,
+        row,
+        categoryNames.get(row.categoryId ?? ""),
+      );
+      return `  ${rowHeader(before)}\n${lines.join("\n")}`;
+    });
+    const body = previewBlocks.join("\n");
+
+    // (5) Dry run stops here: resolved and previewed, but nothing written.
+    if (dryRun) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `DRY RUN — nothing was written. ${planned.length} transaction(s) ` +
+              `would be updated in budget ${budgetId}:\n${body}\n\n` +
+              "Re-run with dryRun:false to commit these changes.",
+          },
+        ],
+      };
+    }
+
+    // (6) COMMIT. Build YNAB's bulk body: an array of rows, each carrying its
+    // id plus ONLY the fields it changes (same field mapping as the single
+    // tool, including dollars -> milliunits). The PatchTransactionsWrapper is
+    // the { transactions } envelope updateTransactions expects.
+    const payload: ynab.PatchTransactionsWrapper = {
+      transactions: planned.map(({ row }) => {
+        const t: ynab.SaveTransactionWithIdOrImportId = {
+          id: row.transactionId,
+        };
+        if (row.categoryId !== undefined) t.category_id = row.categoryId;
+        if (row.payeeName !== undefined) t.payee_name = row.payeeName;
+        if (row.memo !== undefined) t.memo = row.memo;
+        if (row.amount !== undefined) t.amount = dollarsToMilliunits(row.amount);
+        if (row.date !== undefined) t.date = row.date;
+        if (row.approved !== undefined) t.approved = row.approved;
+        if (row.cleared !== undefined) t.cleared = row.cleared;
+        if (row.flagColor !== undefined) t.flag_color = row.flagColor;
+        return t;
+      }),
+    };
+
+    const response = await ynabAPI.transactions.updateTransactions(
+      budgetId,
+      payload,
+    );
+    // YNAB returns the updated rows; index by id to pair each with its `before`.
+    const afterById = new Map(
+      (response.data.transactions ?? []).map((t) => [t.id, t]),
+    );
+
+    // (7) Echo back through the SAME formatter, now passing YNAB's authoritative
+    // `after` so we report what was actually stored (resolved names, its rules).
+    const resultBlocks = planned.map(({ before, row }) => {
+      const after = afterById.get(row.transactionId);
+      const lines = describeRowChanges(
+        before,
+        row,
+        categoryNames.get(row.categoryId ?? ""),
+        after,
+      );
+      return `  ${rowHeader(after ?? before)}\n${lines.join("\n")}`;
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Updated ${planned.length} transaction(s) in budget ${budgetId}:\n` +
+            resultBlocks.join("\n"),
+        },
+      ],
+    };
+  },
+);
+
+// --- 10. Connect over stdio and start serving ------------------------------
 // StdioServerTransport = Claude launches this file as a child process and
 // exchanges JSON messages over stdin/stdout. After connect(), the process
 // stays alive listening — it does NOT exit. Log status to stderr only.
