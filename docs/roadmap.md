@@ -4,6 +4,47 @@ A learning project built incrementally, one chunk at a time. Each tool is
 registered on the MCP server in `src/server.ts` and verified via
 `scripts/smoke-test.ts`. See `docs/ynab-api.md` for the full SDK endpoint map.
 
+## North-star program: clean up, then migrate to a fresh plan (2026-06-12)
+
+The tools exist to serve a larger data-cleanup-and-migration program. Context:
+
+- The live budget **"Budgets are kewl"** has been **connected to bank data for
+  several years but left largely unattended.** As a result the transaction data
+  has **both duplicates and gaps** (missing sources): some bank connections have
+  failed over time, others are still active.
+- That messy data is still **valuable on two counts**: (1) we can use it to
+  **backfill a fresh plan** with the very tools we're building, and (2) it should
+  contain a **representative sample of real spending** to inform a better budget
+  schema.
+
+The program, in order:
+
+1. **Categorize the available data** — work the cleanup queue in the existing
+   plan (this is what Milestone 4's write tools are for; the NYT batch was the
+   first run).
+2. **Evaluate Amazon disambiguation** — assess whether we can resolve vague
+   "Amazon" charges into real categories by **combining them with manual Amazon
+   order-history downloads** (matching by date/amount). Feasibility study, not a
+   commitment yet.
+3. **Adjust the budget schema** — reshape categories/groups based on what the
+   cleaned data and the spending sample reveal (Milestone 5's category tools).
+4. **Create a fresh plan** — stand up a new YNAB plan and **ensure all current
+   accounts are connected.** NOTE/OPEN: the YNAB API has no "create budget"
+   endpoint and bank linking happens in-app, so this step is likely **manual in
+   the YNAB app**, not tool-driven — confirm at code-time.
+5. **Download as much historical data as possible** — pull whatever the freshly
+   connected banks will give (fresh connections typically backfill only a short
+   window, which is exactly why the old plan's history matters).
+6. **Integrate confirmed-good data from "Budgets are kewl"** — backfill the
+   fresh plan with the de-duped, validated historical transactions from the old
+   plan, using `create_transaction` (bulk). The old plan is the long-tail
+   history the new bank connections can't reproduce.
+7. **Categorize all transactions** in the fresh, consolidated plan.
+
+How this maps to the milestones below: **M4** delivers the write/cleanup tools
+(steps 1, and the create/delete tools that make 6 possible); **M5** delivers the
+schema-editing tools (step 3). Steps 4–7 are the migration run that uses them.
+
 ## Done
 
 ### Milestone 1 — scaffold
