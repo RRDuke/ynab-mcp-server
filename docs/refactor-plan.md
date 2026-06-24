@@ -73,26 +73,26 @@ current single file so each change is independently verifiable and low-risk.
 `isError` contract (a control-flow channel, distinct from human-readable text);
 SDKs can throw non-`Error` values; DRYing repeated returns through a tiny helper.
 
-- [ ] **Unwrap YNAB API errors** — add a `ynabErrorText(e)` helper that narrows with
+- [x] **Unwrap YNAB API errors** — add a `ynabErrorText(e)` helper that narrows with
   the SDK's exported `ynab.instanceOfErrorResponse` guard and returns
   `YNAB API error: <name> — <detail>`, falling back to `e.message` / `String(e)`.
   Wrap each tool callback body (or factor a `runTool(fn)` wrapper) to return
   `{ content: [{ type: "text", text: ynabErrorText(e) }], isError: true }`.
   _Why:_ turns `"[object Object]"` into an actionable message exactly when it
   matters. **(small)**
-- [ ] **Add `isError: true` to every hand-built refusal/abort return** — the
+- [x] **Add `isError: true` to every hand-built refusal/abort return** — the
   conflict / unknown-id / no-op / self-transfer / bad-account / batch-cap / bulk
   abort / delete-not-found blocks. **Leave `dryRun` previews and real successes
   without it.** A tiny `fail(text)` helper DRYs the ~13 sites.
   _Why:_ makes "this write was refused" a fact the client can act on, not prose to
   parse. **(small)**
-- [ ] **Declare tool annotations on all 8 tools** — reads `{ readOnlyHint: true,
+- [x] **Declare tool annotations on all 8 tools** — reads `{ readOnlyHint: true,
   openWorldHint: true }`; update/create `{ destructiveHint: true,
   idempotentHint: false }`; delete `{ destructiveHint: true, idempotentHint: true }`.
   _Why:_ `registerTool`'s config accepts `ToolAnnotations` (verified in the
   installed SDK); the read-vs-write distinction currently lives only in prose the
   host can't act on. Makes approval-gating decidable structurally. **(small)**
-- [ ] **Add a server-level `instructions` string** to the `McpServer` options
+- [x] **Add a server-level `instructions` string** to the `McpServer` options
   ("Tools for the user's YNAB budget. Reads are safe; writes mutate bookkeeping —
   not real money. Bulk writes default to dryRun.") and a one-line comment that
   `snake_case verb_noun` tool names are the deliberate MCP convention (so M5 tools

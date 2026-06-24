@@ -34,12 +34,69 @@ const ynabAPI = new ynab.API(token);
 
 // --- 3. Create the MCP server ----------------------------------------------
 // name/version identify this server to Claude during the connection handshake.
-const server = new McpServer({
-  name: "ynab-mcp-server",
-  version: "0.1.0",
-});
+// `instructions` is a server-level hint the host can show the model before any
+// tool call — the one place to state the safety model once, rather than
+// repeating it in every tool description.
+//
+// Tool naming: every tool is snake_case `verb_noun` (list_budgets,
+// update_transaction). That's the deliberate MCP convention here — keep new
+// tools (e.g. Milestone 5's category tools) in the same style; don't drift to
+// camelCase.
+const server = new McpServer(
+  {
+    name: "ynab-mcp-server",
+    version: "0.1.0",
+  },
+  {
+    instructions:
+      "Tools for the user's YNAB budget. Reads are safe; writes mutate " +
+      "bookkeeping — not real money. Bulk writes default to dryRun (preview " +
+      "only) — pass dryRun:false to commit.",
+  },
+);
 
 // --- Helpers ---------------------------------------------------------------
+// Turn whatever was thrown into a readable message. This exists because the
+// YNAB SDK does NOT throw an Error on a non-2xx response — runtime.js does
+// `throw await response.json()`, so a 400 (bad id) or 429 (rate limit) throws
+// the parsed JSON error BODY, a plain object. The MCP SDK then stringifies that
+// to the useless "[object Object]". `ynab.instanceOfErrorResponse` is the SDK's
+// own type guard for that body; we pull the human-readable name + detail out of
+// it. Real network failures throw a genuine Error (FetchError) and fall through
+// to the `e.message` branch, which is already fine.
+function ynabErrorText(e: unknown): string {
+  // The SDK guard takes `object`, so narrow away null/primitives first.
+  if (typeof e === "object" && e !== null && ynab.instanceOfErrorResponse(e)) {
+    return `YNAB API error: ${e.error.name} — ${e.error.detail}`;
+  }
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+// Boundary wrapper for every YNAB API call. On failure it re-throws a REAL
+// Error carrying ynabErrorText's message. The MCP SDK already converts a thrown
+// Error into `{ isError: true, content: [...] }` with `error.message` as the
+// text (see its tool handler) — so wrapping the call is all it takes to turn
+// "[object Object]" into an actionable message AND get the isError flag for
+// free. (Non-Error throws are what we're fixing; this normalizes them.)
+async function ynabCall<T>(op: Promise<T>): Promise<T> {
+  try {
+    return await op;
+  } catch (e) {
+    throw new Error(ynabErrorText(e));
+  }
+}
+
+// A refused/aborted write is a FAILURE the client should be able to detect, not
+// prose to parse. The MCP SDK only sets isError on a throw, so our hand-built
+// guard `return`s need to set it themselves. `type: "text" as const` keeps the
+// literal type the SDK's content union requires (a bare "text" widens to string
+// and won't match). Used by every guard/abort below; dryRun previews and real
+// successes deliberately do NOT use it — they succeeded.
+function fail(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
 // YNAB stores every monetary amount as an integer "milliunit": 1000 = $1.00,
 // so -43210 milliunits = -$43.21. Divide by 1000 and format as currency once,
 // here, so the tools below never repeat this conversion.
@@ -65,7 +122,7 @@ function formatMilliunits(milliunits: number): string {
 async function getAccountTransferPayeeMap(
   budgetId: string,
 ): Promise<Map<string, string>> {
-  const response = await ynabAPI.accounts.getAccounts(budgetId);
+  const response = await ynabCall(ynabAPI.accounts.getAccounts(budgetId));
   const map = new Map<string, string>();
   for (const a of response.data.accounts) {
     if (!a.deleted) map.set(a.id, a.transfer_payee_id);
@@ -93,13 +150,17 @@ server.registerTool(
   "list_budgets",
   {
     title: "List YNAB budgets",
+    // Machine-readable behavior hints (separate from the prose description so a
+    // host can gate approvals structurally). readOnlyHint => no mutation;
+    // openWorldHint => talks to an external system (the YNAB API).
+    annotations: { readOnlyHint: true, openWorldHint: true },
     description:
       "List all of the user's YNAB budgets (plans), returning each one's " +
       "name and id. Read-only.",
   },
   async () => {
     // YNAB renamed "budgets" -> "plans" in v4; the list lives at data.plans.
-    const response = await ynabAPI.plans.getPlans();
+    const response = await ynabCall(ynabAPI.plans.getPlans());
     const plans = response.data.plans;
 
     const lines = plans.map((p) => `- ${p.name} (id: ${p.id})`).join("\n");
@@ -121,6 +182,7 @@ server.registerTool(
   "list_accounts",
   {
     title: "List accounts in a YNAB budget",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     description:
       "List the accounts in a given YNAB budget, with each account's name, " +
       "type, current balance, and transferPayeeId. Closed accounts are " +
@@ -135,7 +197,7 @@ server.registerTool(
     },
   },
   async ({ budgetId }) => {
-    const response = await ynabAPI.accounts.getAccounts(budgetId);
+    const response = await ynabCall(ynabAPI.accounts.getAccounts(budgetId));
     // Skip accounts the user has closed — they're clutter, not current data.
     const accounts = response.data.accounts.filter((a) => !a.closed);
 
@@ -166,6 +228,7 @@ server.registerTool(
   "list_categories",
   {
     title: "List categories in a YNAB budget",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     description:
       "List the budget categories grouped by category group, with each " +
       "category's budgeted, activity, and balance amounts for the current " +
@@ -178,7 +241,7 @@ server.registerTool(
     },
   },
   async ({ budgetId }) => {
-    const response = await ynabAPI.categories.getCategories(budgetId);
+    const response = await ynabCall(ynabAPI.categories.getCategories(budgetId));
     const groups = response.data.category_groups.filter(
       (g) => !g.hidden && !g.deleted,
     );
@@ -237,11 +300,13 @@ async function getAllTransactions(
 
   // Fetch the WHOLE budget (no sinceDate/type) so the cache stays complete and
   // delta sync stays coherent. cursor undefined on the first call -> full set.
-  const response = await ynabAPI.transactions.getTransactions(
-    budgetId,
-    undefined,
-    undefined,
-    cached?.serverKnowledge,
+  const response = await ynabCall(
+    ynabAPI.transactions.getTransactions(
+      budgetId,
+      undefined,
+      undefined,
+      cached?.serverKnowledge,
+    ),
   );
 
   // Merge the delta into the cache: drop deletions, upsert everything else.
@@ -277,6 +342,7 @@ server.registerTool(
   "list_transactions",
   {
     title: "List transactions in a YNAB budget",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     description:
       "List transactions in a given YNAB budget, newest first, showing each " +
       "one's date, payee, category, amount, and account. Optional filters: " +
@@ -404,6 +470,15 @@ server.registerTool(
   "update_transaction",
   {
     title: "Update a single YNAB transaction",
+    // A write: not read-only, may overwrite existing field values
+    // (destructive), and re-running can land different results if the row
+    // changed meanwhile (not idempotent).
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description:
       "Edit one existing transaction in a YNAB budget — typically to assign a " +
       "category and then mark it cleared once vetted. Provide budgetId and " +
@@ -503,16 +578,10 @@ server.registerTool(
     // (2) Guard: payeeName and transferAccountId both set the payee — they
     // conflict. Make the caller pick one rather than silently dropping one.
     if (payeeName !== undefined && transferAccountId !== undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Pass either payeeName OR transferAccountId, not both — they " +
-              "both set the payee. Use transferAccountId for a transfer.",
-          },
-        ],
-      };
+      return fail(
+        "Pass either payeeName OR transferAccountId, not both — they " +
+          "both set the payee. Use transferAccountId for a transfer.",
+      );
     }
 
     // (3) Capture the BEFORE state for echo-back, from the delta-synced cache.
@@ -520,14 +589,9 @@ server.registerTool(
     const all = await getAllTransactions(budgetId, false);
     const before = all.find((t) => t.id === transactionId);
     if (!before) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No transaction with id ${transactionId} found in budget ${budgetId}.`,
-          },
-        ],
-      };
+      return fail(
+        `No transaction with id ${transactionId} found in budget ${budgetId}.`,
+      );
     }
 
     // Resolve a transfer: turn transferAccountId into the target account's
@@ -535,54 +599,36 @@ server.registerTool(
     // a transfer into the row's OWN account (which YNAB can't represent).
     if (transferAccountId !== undefined) {
       if (transferAccountId === before.account_id) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "Cannot transfer a transaction into its own account " +
-                `(${before.account_name}). transferAccountId must be a different account.`,
-            },
-          ],
-        };
+        return fail(
+          "Cannot transfer a transaction into its own account " +
+            `(${before.account_name}). transferAccountId must be a different account.`,
+        );
       }
       const transferPayees = await getAccountTransferPayeeMap(budgetId);
       const payeeId = transferPayees.get(transferAccountId);
       if (payeeId === undefined) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `No account with id ${transferAccountId} found in budget ` +
-                `${budgetId}. Use list_accounts to get a valid transferAccountId.`,
-            },
-          ],
-        };
+        return fail(
+          `No account with id ${transferAccountId} found in budget ` +
+            `${budgetId}. Use list_accounts to get a valid transferAccountId.`,
+        );
       }
       transaction.payee_id = payeeId;
     }
 
     // (4) Guard: refuse a no-op so we don't make a pointless write call.
     if (Object.keys(transaction).length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "No fields to update. Supply at least one of: categoryId, " +
-              "payeeName, transferAccountId, memo, amount, date, approved, " +
-              "cleared, flagColor.",
-          },
-        ],
-      };
+      return fail(
+        "No fields to update. Supply at least one of: categoryId, " +
+          "payeeName, transferAccountId, memo, amount, date, approved, " +
+          "cleared, flagColor.",
+      );
     }
 
     // (5) Write. The PutTransactionWrapper is the { transaction } envelope.
-    const response = await ynabAPI.transactions.updateTransaction(
-      budgetId,
-      transactionId,
-      { transaction },
+    const response = await ynabCall(
+      ynabAPI.transactions.updateTransaction(budgetId, transactionId, {
+        transaction,
+      }),
     );
     const after = response.data.transaction;
 
@@ -730,7 +776,7 @@ function rowHeader(t: ynab.TransactionDetail): string {
 async function getCategoryNameMap(
   budgetId: string,
 ): Promise<Map<string, string>> {
-  const response = await ynabAPI.categories.getCategories(budgetId);
+  const response = await ynabCall(ynabAPI.categories.getCategories(budgetId));
   const map = new Map<string, string>();
   for (const group of response.data.category_groups) {
     for (const c of group.categories) map.set(c.id, c.name);
@@ -742,6 +788,12 @@ server.registerTool(
   "update_transactions",
   {
     title: "Update multiple YNAB transactions (bulk)",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description:
       "Edit many existing transactions in one call. MUTATES data, but dryRun " +
       "defaults to TRUE: the call previews the planned change without writing " +
@@ -821,17 +873,11 @@ server.registerTool(
   async ({ budgetId, transactions, dryRun }) => {
     // (1) Batch cap — reject oversized calls before doing any work.
     if (transactions.length > MAX_BULK_TRANSACTIONS) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Too many rows (${transactions.length}). The bulk cap is ` +
-              `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
-              "and retry.",
-          },
-        ],
-      };
+      return fail(
+        `Too many rows (${transactions.length}). The bulk cap is ` +
+          `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
+          "and retry.",
+      );
     }
 
     // (2) Resolve current state (delta-synced cache) + category names + account
@@ -897,74 +943,44 @@ server.registerTool(
     }
 
     if (unknownIds.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Aborted — nothing written. These transactionId(s) were not " +
-              `found in budget ${budgetId}:\n` +
-              unknownIds.map((id) => `  - ${id}`).join("\n") +
-              "\nFix or remove them and retry.",
-          },
-        ],
-      };
+      return fail(
+        "Aborted — nothing written. These transactionId(s) were not " +
+          `found in budget ${budgetId}:\n` +
+          unknownIds.map((id) => `  - ${id}`).join("\n") +
+          "\nFix or remove them and retry.",
+      );
     }
     if (noopIds.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Aborted — nothing written. These row(s) have no fields to " +
-              "change (only a transactionId):\n" +
-              noopIds.map((id) => `  - ${id}`).join("\n") +
-              "\nGive each row at least one field besides transactionId.",
-          },
-        ],
-      };
+      return fail(
+        "Aborted — nothing written. These row(s) have no fields to " +
+          "change (only a transactionId):\n" +
+          noopIds.map((id) => `  - ${id}`).join("\n") +
+          "\nGive each row at least one field besides transactionId.",
+      );
     }
     if (conflictIds.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Aborted — nothing written. These row(s) set BOTH payeeName and " +
-              "transferAccountId (they conflict — pick one):\n" +
-              conflictIds.map((id) => `  - ${id}`).join("\n") +
-              "\nUse transferAccountId for a transfer; drop payeeName.",
-          },
-        ],
-      };
+      return fail(
+        "Aborted — nothing written. These row(s) set BOTH payeeName and " +
+          "transferAccountId (they conflict — pick one):\n" +
+          conflictIds.map((id) => `  - ${id}`).join("\n") +
+          "\nUse transferAccountId for a transfer; drop payeeName.",
+      );
     }
     if (selfTransferIds.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Aborted — nothing written. These row(s) transfer into their OWN " +
-              "account, which YNAB can't represent:\n" +
-              selfTransferIds.map((id) => `  - ${id}`).join("\n") +
-              "\nUse a different transferAccountId.",
-          },
-        ],
-      };
+      return fail(
+        "Aborted — nothing written. These row(s) transfer into their OWN " +
+          "account, which YNAB can't represent:\n" +
+          selfTransferIds.map((id) => `  - ${id}`).join("\n") +
+          "\nUse a different transferAccountId.",
+      );
     }
     if (badTransferAccounts.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Aborted — nothing written. Unknown transferAccountId(s) in budget ` +
-              `${budgetId}:\n` +
-              badTransferAccounts.map((id) => `  - ${id}`).join("\n") +
-              "\nUse list_accounts to get valid account ids.",
-          },
-        ],
-      };
+      return fail(
+        `Aborted — nothing written. Unknown transferAccountId(s) in budget ` +
+          `${budgetId}:\n` +
+          badTransferAccounts.map((id) => `  - ${id}`).join("\n") +
+          "\nUse list_accounts to get valid account ids.",
+      );
     }
 
     // (4) Build the per-row preview with the SHARED formatter (no `after` arg,
@@ -1019,9 +1035,8 @@ server.registerTool(
       }),
     };
 
-    const response = await ynabAPI.transactions.updateTransactions(
-      budgetId,
-      payload,
+    const response = await ynabCall(
+      ynabAPI.transactions.updateTransactions(budgetId, payload),
     );
     // YNAB returns the updated rows; index by id to pair each with its `before`.
     const afterById = new Map(
@@ -1069,7 +1084,7 @@ server.registerTool(
 async function getAccountNameMap(
   budgetId: string,
 ): Promise<Map<string, string>> {
-  const response = await ynabAPI.accounts.getAccounts(budgetId);
+  const response = await ynabCall(ynabAPI.accounts.getAccounts(budgetId));
   const map = new Map<string, string>();
   for (const a of response.data.accounts) {
     if (!a.deleted) map.set(a.id, a.name);
@@ -1122,6 +1137,12 @@ server.registerTool(
   "create_transactions",
   {
     title: "Create new YNAB transactions (single or bulk)",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description:
       "Add one or more brand-new transactions to a budget. Each row REQUIRES " +
       "accountId, date (YYYY-MM-DD), and amount (in dollars, negative for an " +
@@ -1198,17 +1219,11 @@ server.registerTool(
   async ({ budgetId, transactions, dryRun }) => {
     // (1) Batch cap — reject oversized calls before doing any work.
     if (transactions.length > MAX_BULK_TRANSACTIONS) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Too many rows (${transactions.length}). The bulk cap is ` +
-              `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
-              "and retry.",
-          },
-        ],
-      };
+      return fail(
+        `Too many rows (${transactions.length}). The bulk cap is ` +
+          `${MAX_BULK_TRANSACTIONS} per call — split into smaller batches ` +
+          "and retry.",
+      );
     }
 
     // (2) Resolve account + category names + transfer payees: used both to
@@ -1258,17 +1273,11 @@ server.registerTool(
           (r) => `  - ${r}: transfers into its own account`,
         ),
       ];
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Aborted — nothing created. Problem(s) in budget ${budgetId}:\n` +
-              problems.join("\n") +
-              "\nUse list_accounts / list_categories to get valid ids.",
-          },
-        ],
-      };
+      return fail(
+        `Aborted — nothing created. Problem(s) in budget ${budgetId}:\n` +
+          problems.join("\n") +
+          "\nUse list_accounts / list_categories to get valid ids.",
+      );
     }
 
     // (4) Build the preview from the (now validated) rows.
@@ -1320,9 +1329,8 @@ server.registerTool(
       }),
     };
 
-    const response = await ynabAPI.transactions.createTransaction(
-      budgetId,
-      payload,
+    const response = await ynabCall(
+      ynabAPI.transactions.createTransaction(budgetId, payload),
     );
     const created = response.data.transactions ?? [];
 
@@ -1359,6 +1367,14 @@ server.registerTool(
   "delete_transaction",
   {
     title: "Delete a single YNAB transaction",
+    // Destructive (removes a row), but idempotent: deleting an already-deleted
+    // id converges to the same state (our guard reports it as not-found).
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     description:
       "Permanently delete one transaction from a YNAB budget — typically to " +
       "remove a duplicate or junk row. Provide budgetId and transactionId. " +
@@ -1378,17 +1394,14 @@ server.registerTool(
     const all = await getAllTransactions(budgetId, false);
     const before = all.find((t) => t.id === transactionId);
     if (!before) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No transaction with id ${transactionId} found in budget ${budgetId}.`,
-          },
-        ],
-      };
+      return fail(
+        `No transaction with id ${transactionId} found in budget ${budgetId}.`,
+      );
     }
 
-    await ynabAPI.transactions.deleteTransaction(budgetId, transactionId);
+    await ynabCall(
+      ynabAPI.transactions.deleteTransaction(budgetId, transactionId),
+    );
 
     return {
       content: [
