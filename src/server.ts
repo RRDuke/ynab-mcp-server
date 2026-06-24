@@ -56,6 +56,23 @@ function formatMilliunits(milliunits: number): string {
   }).format(milliunits / 1000);
 }
 
+// Maps each account id -> its transfer_payee_id (the hidden payee that means
+// "money moving INTO this account"). This is how a transfer is recorded in
+// YNAB: set a transaction's payee_id to the TARGET account's transfer_payee_id
+// and YNAB auto-creates the linked mirror row. Our write tools take a friendly
+// `transferAccountId` and use this map to look up the payee_id to send. Skips
+// deleted accounts; parallels getAccountNameMap (defined later).
+async function getAccountTransferPayeeMap(
+  budgetId: string,
+): Promise<Map<string, string>> {
+  const response = await ynabAPI.accounts.getAccounts(budgetId);
+  const map = new Map<string, string>();
+  for (const a of response.data.accounts) {
+    if (!a.deleted) map.set(a.id, a.transfer_payee_id);
+  }
+  return map;
+}
+
 // The inverse of formatMilliunits, for the WRITE path: Claude thinks in dollars
 // (43.21), YNAB stores integer milliunits (43210). Multiplying by 1000 isn't
 // enough — binary floating point can't represent 43.21 exactly, so
@@ -106,8 +123,11 @@ server.registerTool(
     title: "List accounts in a YNAB budget",
     description:
       "List the accounts in a given YNAB budget, with each account's name, " +
-      "type, and current balance. Closed accounts are omitted. Read-only. " +
-      "Use list_budgets first to find the budgetId.",
+      "type, current balance, and transferPayeeId. Closed accounts are " +
+      "omitted. Read-only. Use list_budgets first to find the budgetId. The " +
+      "transferPayeeId is the handle for moving money INTO this account; to " +
+      "record a transfer (e.g. a credit-card payment), pass the TARGET " +
+      "account's id as transferAccountId on a write tool.",
     inputSchema: {
       budgetId: z
         .string()
@@ -122,7 +142,8 @@ server.registerTool(
     const lines = accounts
       .map(
         (a) =>
-          `- ${a.name} [${a.type}]: ${formatMilliunits(a.balance)} (id: ${a.id})`,
+          `- ${a.name} [${a.type}]: ${formatMilliunits(a.balance)} ` +
+          `(id: ${a.id}, transferPayeeId: ${a.transfer_payee_id})`,
       )
       .join("\n");
     const text =
@@ -408,7 +429,18 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "Set the payee name. Resolves to an existing payee or creates one.",
+          "Set the payee name. Resolves to an existing payee or creates one. " +
+            "For a transfer, use transferAccountId instead (not payeeName).",
+        ),
+      transferAccountId: z
+        .string()
+        .optional()
+        .describe(
+          "Turn this row into a transfer INTO the given account (its id from " +
+            "list_accounts) — e.g. a credit-card payment or a move to savings. " +
+            "The tool resolves that account's transfer payee for you. A transfer " +
+            "should not also carry a spending category. Cannot be combined with " +
+            "payeeName.",
         ),
       memo: z.string().optional().describe("Set the transaction memo/note."),
       amount: z
@@ -445,6 +477,7 @@ server.registerTool(
     transactionId,
     categoryId,
     payeeName,
+    transferAccountId,
     memo,
     amount,
     date,
@@ -455,7 +488,8 @@ server.registerTool(
     // (1) Build the partial update from ONLY the fields the caller supplied.
     // Each `!== undefined` check means an omitted arg leaves that field
     // untouched on YNAB's side. amount is the one conversion: dollars -> the
-    // integer milliunits YNAB stores.
+    // integer milliunits YNAB stores. payee_id (the transfer) is resolved in
+    // step (3) once we have the row's own account to guard against.
     const transaction: ynab.ExistingTransaction = {};
     if (categoryId !== undefined) transaction.category_id = categoryId;
     if (payeeName !== undefined) transaction.payee_name = payeeName;
@@ -466,15 +500,16 @@ server.registerTool(
     if (cleared !== undefined) transaction.cleared = cleared;
     if (flagColor !== undefined) transaction.flag_color = flagColor;
 
-    // (2) Guard: refuse a no-op so we don't make a pointless write call.
-    if (Object.keys(transaction).length === 0) {
+    // (2) Guard: payeeName and transferAccountId both set the payee — they
+    // conflict. Make the caller pick one rather than silently dropping one.
+    if (payeeName !== undefined && transferAccountId !== undefined) {
       return {
         content: [
           {
             type: "text",
             text:
-              "No fields to update. Supply at least one of: categoryId, " +
-              "payeeName, memo, amount, date, approved, cleared, flagColor.",
+              "Pass either payeeName OR transferAccountId, not both — they " +
+              "both set the payee. Use transferAccountId for a transfer.",
           },
         ],
       };
@@ -495,7 +530,55 @@ server.registerTool(
       };
     }
 
-    // (4) Write. The PutTransactionWrapper is the { transaction } envelope.
+    // Resolve a transfer: turn transferAccountId into the target account's
+    // transfer_payee_id (the payee_id YNAB wants). Reject an unknown account or
+    // a transfer into the row's OWN account (which YNAB can't represent).
+    if (transferAccountId !== undefined) {
+      if (transferAccountId === before.account_id) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Cannot transfer a transaction into its own account " +
+                `(${before.account_name}). transferAccountId must be a different account.`,
+            },
+          ],
+        };
+      }
+      const transferPayees = await getAccountTransferPayeeMap(budgetId);
+      const payeeId = transferPayees.get(transferAccountId);
+      if (payeeId === undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `No account with id ${transferAccountId} found in budget ` +
+                `${budgetId}. Use list_accounts to get a valid transferAccountId.`,
+            },
+          ],
+        };
+      }
+      transaction.payee_id = payeeId;
+    }
+
+    // (4) Guard: refuse a no-op so we don't make a pointless write call.
+    if (Object.keys(transaction).length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "No fields to update. Supply at least one of: categoryId, " +
+              "payeeName, transferAccountId, memo, amount, date, approved, " +
+              "cleared, flagColor.",
+          },
+        ],
+      };
+    }
+
+    // (5) Write. The PutTransactionWrapper is the { transaction } envelope.
     const response = await ynabAPI.transactions.updateTransaction(
       budgetId,
       transactionId,
@@ -503,7 +586,7 @@ server.registerTool(
     );
     const after = response.data.transaction;
 
-    // (5) Echo back each changed field old -> new. We use the API's response
+    // (6) Echo back each changed field old -> new. We use the API's response
     // as the authoritative "after" (YNAB resolves names, applies its rules).
     // Only fields the caller actually passed are listed.
     const changes: string[] = [];
@@ -514,6 +597,10 @@ server.registerTool(
     if (payeeName !== undefined)
       changes.push(
         `  payee: ${before.payee_name ?? "(none)"} -> ${after.payee_name ?? "(none)"}`,
+      );
+    if (transferAccountId !== undefined)
+      changes.push(
+        `  transfer: ${before.payee_name ?? "(none)"} -> ${after.payee_name ?? "(none)"}`,
       );
     if (memo !== undefined)
       changes.push(`  memo: ${before.memo ?? "(none)"} -> ${after.memo ?? "(none)"}`);
@@ -558,6 +645,7 @@ type BulkRow = {
   transactionId: string;
   categoryId?: string;
   payeeName?: string;
+  transferAccountId?: string;
   memo?: string;
   amount?: number;
   date?: string;
@@ -576,6 +664,7 @@ function describeRowChanges(
   before: ynab.TransactionDetail,
   row: BulkRow,
   intendedCategoryName: string | undefined,
+  intendedTransferAccountName: string | undefined,
   after?: ynab.TransactionDetail,
 ): string[] {
   const lines: string[] = [];
@@ -590,6 +679,14 @@ function describeRowChanges(
   if (row.payeeName !== undefined)
     lines.push(
       `    payee: ${before.payee_name ?? "(none)"} -> ${after ? (after.payee_name ?? "(none)") : row.payeeName}`,
+    );
+  if (row.transferAccountId !== undefined)
+    lines.push(
+      `    transfer: ${before.payee_name ?? "(none)"} -> ${
+        after
+          ? (after.payee_name ?? "(none)")
+          : `Transfer : ${intendedTransferAccountName ?? "(unknown account id)"}`
+      }`,
     );
   if (row.memo !== undefined)
     lines.push(
@@ -671,7 +768,19 @@ server.registerTool(
             payeeName: z
               .string()
               .optional()
-              .describe("Set the payee name (resolves or creates a payee)."),
+              .describe(
+                "Set the payee name (resolves or creates a payee). For a " +
+                  "transfer, use transferAccountId instead.",
+              ),
+            transferAccountId: z
+              .string()
+              .optional()
+              .describe(
+                "Make this row a transfer INTO the given account (its id from " +
+                  "list_accounts) — e.g. a credit-card payment or move to " +
+                  "savings. Resolves that account's transfer payee. Should not " +
+                  "also carry a category; cannot be combined with payeeName.",
+              ),
             memo: z.string().optional().describe("Set the memo/note."),
             amount: z
               .number()
@@ -725,34 +834,66 @@ server.registerTool(
       };
     }
 
-    // (2) Resolve current state (delta-synced cache) + category names, so we
-    // can validate ids now and render a readable preview shortly.
+    // (2) Resolve current state (delta-synced cache) + category names + account
+    // maps (names for readable previews, transfer payees to resolve transfers),
+    // so we can validate ids now and render a readable preview shortly.
     const all = await getAllTransactions(budgetId, false);
     const byId = new Map(all.map((t) => [t.id, t]));
     const categoryNames = await getCategoryNameMap(budgetId);
+    const accountNames = await getAccountNameMap(budgetId);
+    const transferPayees = await getAccountTransferPayeeMap(budgetId);
 
     // (3) Validate every row up front. Collect problems and abort the WHOLE
-    // batch if any row is bad — never a partial write.
+    // batch if any row is bad — never a partial write. Each planned row also
+    // carries its resolved transferPayeeId (when it's a transfer) for commit.
     const unknownIds: string[] = [];
     const noopIds: string[] = [];
-    const planned: { before: ynab.TransactionDetail; row: BulkRow }[] = [];
+    const conflictIds: string[] = []; // payeeName AND transferAccountId both set
+    const selfTransferIds: string[] = []; // transfer into the row's own account
+    const badTransferAccounts: string[] = []; // transferAccountId not an account
+    const planned: {
+      before: ynab.TransactionDetail;
+      row: BulkRow;
+      transferPayeeId?: string;
+    }[] = [];
     for (const row of transactions) {
       const before = byId.get(row.transactionId);
       if (!before) {
         unknownIds.push(row.transactionId);
         continue;
       }
+      // Resolve/validate a transfer (mirrors the single update_transaction):
+      // payeeName conflict, self-transfer, and unknown account each abort.
+      let transferPayeeId: string | undefined;
+      if (row.transferAccountId !== undefined) {
+        if (row.payeeName !== undefined) {
+          conflictIds.push(row.transactionId);
+          continue;
+        }
+        if (row.transferAccountId === before.account_id) {
+          selfTransferIds.push(row.transactionId);
+          continue;
+        }
+        transferPayeeId = transferPayees.get(row.transferAccountId);
+        if (transferPayeeId === undefined) {
+          badTransferAccounts.push(row.transferAccountId);
+          continue;
+        }
+      }
       // A row that changes nothing produces zero change lines — reject it.
       const changeCount = describeRowChanges(
         before,
         row,
         categoryNames.get(row.categoryId ?? ""),
+        row.transferAccountId
+          ? accountNames.get(row.transferAccountId)
+          : undefined,
       ).length;
       if (changeCount === 0) {
         noopIds.push(row.transactionId);
         continue;
       }
-      planned.push({ before, row });
+      planned.push({ before, row, transferPayeeId });
     }
 
     if (unknownIds.length > 0) {
@@ -783,6 +924,48 @@ server.registerTool(
         ],
       };
     }
+    if (conflictIds.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Aborted — nothing written. These row(s) set BOTH payeeName and " +
+              "transferAccountId (they conflict — pick one):\n" +
+              conflictIds.map((id) => `  - ${id}`).join("\n") +
+              "\nUse transferAccountId for a transfer; drop payeeName.",
+          },
+        ],
+      };
+    }
+    if (selfTransferIds.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Aborted — nothing written. These row(s) transfer into their OWN " +
+              "account, which YNAB can't represent:\n" +
+              selfTransferIds.map((id) => `  - ${id}`).join("\n") +
+              "\nUse a different transferAccountId.",
+          },
+        ],
+      };
+    }
+    if (badTransferAccounts.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Aborted — nothing written. Unknown transferAccountId(s) in budget ` +
+              `${budgetId}:\n` +
+              badTransferAccounts.map((id) => `  - ${id}`).join("\n") +
+              "\nUse list_accounts to get valid account ids.",
+          },
+        ],
+      };
+    }
 
     // (4) Build the per-row preview with the SHARED formatter (no `after` arg,
     // so it renders the caller's intended values).
@@ -791,6 +974,9 @@ server.registerTool(
         before,
         row,
         categoryNames.get(row.categoryId ?? ""),
+        row.transferAccountId
+          ? accountNames.get(row.transferAccountId)
+          : undefined,
       );
       return `  ${rowHeader(before)}\n${lines.join("\n")}`;
     });
@@ -816,12 +1002,13 @@ server.registerTool(
     // tool, including dollars -> milliunits). The PatchTransactionsWrapper is
     // the { transactions } envelope updateTransactions expects.
     const payload: ynab.PatchTransactionsWrapper = {
-      transactions: planned.map(({ row }) => {
+      transactions: planned.map(({ row, transferPayeeId }) => {
         const t: ynab.SaveTransactionWithIdOrImportId = {
           id: row.transactionId,
         };
         if (row.categoryId !== undefined) t.category_id = row.categoryId;
         if (row.payeeName !== undefined) t.payee_name = row.payeeName;
+        if (transferPayeeId !== undefined) t.payee_id = transferPayeeId;
         if (row.memo !== undefined) t.memo = row.memo;
         if (row.amount !== undefined) t.amount = dollarsToMilliunits(row.amount);
         if (row.date !== undefined) t.date = row.date;
@@ -849,6 +1036,9 @@ server.registerTool(
         before,
         row,
         categoryNames.get(row.categoryId ?? ""),
+        row.transferAccountId
+          ? accountNames.get(row.transferAccountId)
+          : undefined,
         after,
       );
       return `  ${rowHeader(after ?? before)}\n${lines.join("\n")}`;
@@ -896,6 +1086,7 @@ type NewRow = {
   amount: number;
   payeeName?: string;
   categoryId?: string;
+  transferAccountId?: string;
   memo?: string;
   approved?: boolean;
   cleared?: "cleared" | "uncleared" | "reconciled";
@@ -903,14 +1094,20 @@ type NewRow = {
 };
 
 // Render a row we WOULD create (preview): a one-line summary plus indented
-// detail lines for any optional fields that were set.
+// detail lines for any optional fields that were set. For a transfer the payee
+// shows as "Transfer : <target account>" (transferAccountName), mirroring how
+// YNAB labels it.
 function describeNewRow(
   row: NewRow,
   accountName: string,
   categoryName: string | undefined,
+  transferAccountName: string | undefined,
 ): string {
+  const payeeLabel = row.transferAccountId
+    ? `Transfer : ${transferAccountName ?? "(unknown account id)"}`
+    : (row.payeeName ?? "(no payee)");
   const header =
-    `  ${row.date} | ${row.payeeName ?? "(no payee)"} | ` +
+    `  ${row.date} | ${payeeLabel} | ` +
     `${categoryName ?? "(uncategorized)"} | ` +
     `${formatMilliunits(dollarsToMilliunits(row.amount))} [${accountName}]`;
   const extra: string[] = [];
@@ -955,11 +1152,23 @@ server.registerTool(
             payeeName: z
               .string()
               .optional()
-              .describe("Payee name (resolves or creates a payee)."),
+              .describe(
+                "Payee name (resolves or creates a payee). For a transfer, use " +
+                  "transferAccountId instead.",
+              ),
             categoryId: z
               .string()
               .optional()
               .describe("Category id (from list_categories)."),
+            transferAccountId: z
+              .string()
+              .optional()
+              .describe(
+                "Create this row as a transfer INTO the given account (its id " +
+                  "from list_accounts). Resolves that account's transfer payee. " +
+                  "Should not also carry a category; cannot be combined with " +
+                  "payeeName, and cannot equal this row's own accountId.",
+              ),
             memo: z.string().optional().describe("Memo/note."),
             approved: z
               .boolean()
@@ -1002,31 +1211,59 @@ server.registerTool(
       };
     }
 
-    // (2) Resolve account + category names: used both to VALIDATE the ids the
-    // caller passed and to render a readable preview.
+    // (2) Resolve account + category names + transfer payees: used both to
+    // VALIDATE the ids the caller passed and to render a readable preview.
     const accountNames = await getAccountNameMap(budgetId);
     const categoryNames = await getCategoryNameMap(budgetId);
+    const transferPayees = await getAccountTransferPayeeMap(budgetId);
 
-    // (3) Validate ids up front; abort the WHOLE batch if any are unknown (a
-    // bad account/category id is a likely slip — fail before creating anything).
+    // (3) Validate ids up front; abort the WHOLE batch if anything's off (a bad
+    // id or a malformed transfer is a likely slip — fail before creating
+    // anything). Rows are referenced by 1-based position since they have no id
+    // yet.
     const badAccounts = new Set<string>();
     const badCategories = new Set<string>();
-    for (const row of transactions) {
+    const badTransferAccounts = new Set<string>();
+    const conflictRows: string[] = []; // payeeName AND transferAccountId
+    const selfTransferRows: string[] = []; // transferAccountId === own accountId
+    transactions.forEach((row, i) => {
       if (!accountNames.has(row.accountId)) badAccounts.add(row.accountId);
       if (row.categoryId !== undefined && !categoryNames.has(row.categoryId))
         badCategories.add(row.categoryId);
-    }
-    if (badAccounts.size > 0 || badCategories.size > 0) {
+      if (row.transferAccountId !== undefined) {
+        if (row.payeeName !== undefined) conflictRows.push(`row ${i + 1}`);
+        if (row.transferAccountId === row.accountId)
+          selfTransferRows.push(`row ${i + 1}`);
+        if (!transferPayees.has(row.transferAccountId))
+          badTransferAccounts.add(row.transferAccountId);
+      }
+    });
+    if (
+      badAccounts.size > 0 ||
+      badCategories.size > 0 ||
+      badTransferAccounts.size > 0 ||
+      conflictRows.length > 0 ||
+      selfTransferRows.length > 0
+    ) {
       const problems = [
         ...[...badAccounts].map((id) => `  - unknown accountId: ${id}`),
         ...[...badCategories].map((id) => `  - unknown categoryId: ${id}`),
+        ...[...badTransferAccounts].map(
+          (id) => `  - unknown transferAccountId: ${id}`,
+        ),
+        ...conflictRows.map(
+          (r) => `  - ${r}: set both payeeName and transferAccountId (pick one)`,
+        ),
+        ...selfTransferRows.map(
+          (r) => `  - ${r}: transfers into its own account`,
+        ),
       ];
       return {
         content: [
           {
             type: "text",
             text:
-              `Aborted — nothing created. Unknown id(s) in budget ${budgetId}:\n` +
+              `Aborted — nothing created. Problem(s) in budget ${budgetId}:\n` +
               problems.join("\n") +
               "\nUse list_accounts / list_categories to get valid ids.",
           },
@@ -1040,6 +1277,9 @@ server.registerTool(
         row,
         accountNames.get(row.accountId)!,
         row.categoryId ? categoryNames.get(row.categoryId) : undefined,
+        row.transferAccountId
+          ? accountNames.get(row.transferAccountId)
+          : undefined,
       ),
     );
     const body = previewBlocks.join("\n");
@@ -1069,6 +1309,8 @@ server.registerTool(
           amount: dollarsToMilliunits(row.amount),
         };
         if (row.payeeName !== undefined) t.payee_name = row.payeeName;
+        if (row.transferAccountId !== undefined)
+          t.payee_id = transferPayees.get(row.transferAccountId);
         if (row.categoryId !== undefined) t.category_id = row.categoryId;
         if (row.memo !== undefined) t.memo = row.memo;
         if (row.approved !== undefined) t.approved = row.approved;

@@ -155,11 +155,41 @@ our own write with no invalidation.
   row, deleted it, confirmed gone via a forced-refresh read — no residue). Smoke
   test exercises the not-found guard only (delete has no dryRun).
 
-**✅ Milestone 4 write tools COMPLETE (2026-06-12):** `update_transaction`,
-`update_transactions`, `create_transactions`, `delete_transaction` all built and
-verified live. The cleanup workflow now has its full toolset. Remaining M4 work
-is using them (categorize the ~1.3k uncategorized backlog) + the Amazon
-disambiguation study (program step 2).
+**Transfer support (DONE 2026-06-24).** The write tools couldn't link transfers
+(credit-card payments, moves to savings/brokerage, wires) — money moving between
+two of your own accounts, which YNAB models as a category-less paired
+transaction, NOT spending. Added across `list_accounts` + all three write tools:
+- **How YNAB records a transfer (verified against the installed SDK):** there is
+  NO writable `transfer_account_id`. You set the transaction's `payee_id` to the
+  TARGET account's `transfer_payee_id` (a hidden per-account "money into me"
+  payee); YNAB then auto-creates the linked mirror row on the other account.
+- **`list_accounts`** now surfaces each account's `transferPayeeId` (the enabler
+  + auditability).
+- **Design (Option 1 — friendly):** the write tools take a `transferAccountId`
+  (a normal account id from `list_accounts`); the tool resolves it to that
+  account's `transfer_payee_id` internally and sends it as `payee_id`. Claude
+  never hand-carries the raw payee id. Added to `update_transaction` (single),
+  `update_transactions` (bulk), and `create_transactions`.
+- **Guards (mirror the existing safety posture):** `transferAccountId` and
+  `payeeName` conflict (both set the payee → rejected); a transfer into the row's
+  OWN account is rejected; an unknown `transferAccountId` is rejected. On the
+  bulk/array tools these abort the WHOLE batch (no partial writes), consistent
+  with the unknown-id handling. Previews/echo-back render the transfer as
+  "Transfer : <target account>".
+- **Verified in dry-run** against the real budget via the smoke test (new
+  transfer case); **live linking deferred** — will be done "in prod" when next
+  reconciling the Chase CC payment lines (it's a real write).
+- Unblocks the deferred **Chase CC payment** rows from the 2026-06-21 backlog
+  cleanup (left untouched precisely because transfers weren't supported) + the
+  Fidelity/wire transfer rows.
+
+**✅ Milestone 4 write tools COMPLETE (2026-06-12; transfer support added
+2026-06-24):** `update_transaction`, `update_transactions`, `create_transactions`,
+`delete_transaction` all built and verified live, now with transfer linking. The
+cleanup workflow has its full toolset. Remaining M4 work is using them
+(categorize the backlog incl. the now-linkable Chase CC payments) + the Amazon
+disambiguation study (program step 2). Still owed: `import_id` on create before
+the backfill (step 6).
 
 **New concepts introduced here:**
 - Nested request-body wrappers: inputSchema grows from flat fields to nested

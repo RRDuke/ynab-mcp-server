@@ -86,10 +86,15 @@ if (txnId && categoryId) {
   });
 }
 
-// 5. create_transactions — DRY RUN ONLY. Scrape a real accountId and preview
+// 5. create_transactions — DRY RUN ONLY. Scrape real accountId(s) and preview
 //    adding one row. dryRun defaults to true, so nothing is created. (No
 //    import_id yet — dedup is deferred to the backfill step; see roadmap.)
-const accountId = accountsText.match(/\(id: ([0-9a-f-]+)\)/i)?.[1];
+//    NOTE: account lines now read "(id: ..., transferPayeeId: ...)", so the id
+//    scrape must NOT require a closing paren right after the id.
+const accountIds = [...accountsText.matchAll(/\(id: ([0-9a-f-]+)/gi)].map(
+  (m) => m[1],
+);
+const accountId = accountIds[0];
 if (accountId) {
   await callAndPrint("create_transactions", {
     budgetId,
@@ -100,6 +105,25 @@ if (accountId) {
         amount: -1.23,
         payeeName: "Smoke Test",
         memo: "dry-run only",
+      },
+    ],
+  });
+}
+
+// 5b. create_transactions TRANSFER — DRY RUN ONLY. With two distinct accounts,
+//     preview a transfer FROM accountIds[0] INTO accountIds[1] (the transfer
+//     target resolves to that account's transfer payee). Exercises the new
+//     transferAccountId path end to end without writing.
+if (accountIds.length >= 2 && accountIds[0] !== accountIds[1]) {
+  await callAndPrint("create_transactions", {
+    budgetId,
+    transactions: [
+      {
+        accountId: accountIds[0],
+        transferAccountId: accountIds[1],
+        date: "2026-06-01",
+        amount: -10.0,
+        memo: "transfer dry-run only",
       },
     ],
   });
