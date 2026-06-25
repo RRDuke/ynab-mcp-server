@@ -140,6 +140,106 @@ function dollarsToMilliunits(dollars: number): number {
   return Math.round(dollars * 1000);
 }
 
+// --- Shared schema pieces --------------------------------------------------
+// Source the allowed enum values from the YNAB SDK itself rather than retyping
+// the string lists at each tool. `ynab.TransactionClearedStatus` and
+// `TransactionFlagColor` are `as const` objects (e.g. { Cleared: "cleared" });
+// zod 4's z.enum accepts such an enum-like object directly and infers the value
+// union ("cleared" | "uncleared" | "reconciled"), so the schema can't drift from
+// the SDK. The one wrinkle: TransactionFlagColor includes an Empty: "" member
+// (YNAB's "no flag"), which we don't want callers passing — .exclude(["Empty"])
+// drops it by member name, leaving the six real colors. These are immutable base
+// schemas: each tool below chains .optional().describe(...) onto them, which
+// returns a NEW schema and never mutates the shared base, so reuse is safe.
+const clearedEnum = z.enum(ynab.TransactionClearedStatus);
+const flagColorEnum = z.enum(ynab.TransactionFlagColor).exclude(["Empty"]);
+
+// Two standalone base validators reused by the write tools. They stay BASE
+// schemas (no .optional()/.describe()) on purpose: amount and date are OPTIONAL
+// when editing an existing row but REQUIRED when creating one, so each tool adds
+// the optionality and wording that fit. Sharing the base keeps the "dollars"
+// rule and the ISO-date regex (with one error message) in exactly one place.
+const dollarAmount = z.number();
+const isoDate = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO format YYYY-MM-DD");
+
+// The fields all three write tools accept as OPTIONAL edits, defined once. Each
+// entry is a fully-formed validator (type + .optional() + one canonical
+// description), so spreading this object into a tool's inputSchema gives every
+// tool the same fields with the same Claude-facing guidance — collapsing wording
+// that had drifted three different ways (the transferAccountId blurb especially).
+// zod schemas are immutable and stateless during parsing, so reusing these same
+// instances across all three schemas is safe. amount/date are deliberately NOT
+// here — their required-ness differs (see the base validators above).
+const txnOptionalFields = {
+  categoryId: z
+    .string()
+    .optional()
+    .describe(
+      "Assign this category (an id from list_categories). The category of an " +
+        "existing split transaction can't be changed.",
+    ),
+  payeeName: z
+    .string()
+    .optional()
+    .describe(
+      "Set the payee name (resolves to an existing payee or creates one). For " +
+        "a transfer, use transferAccountId instead, not payeeName.",
+    ),
+  transferAccountId: z
+    .string()
+    .optional()
+    .describe(
+      "Turn this row into a transfer INTO the given account (its id from " +
+        "list_accounts) — e.g. a credit-card payment or a move to savings. The " +
+        "tool resolves that account's transfer payee for you. A transfer should " +
+        "not also carry a spending category, and can't be combined with payeeName.",
+    ),
+  memo: z.string().optional().describe("Set the transaction memo/note."),
+  approved: z
+    .boolean()
+    .optional()
+    .describe("Mark the transaction approved (true) or unapproved (false)."),
+  cleared: clearedEnum
+    .optional()
+    .describe(
+      "Set the cleared status. Mark 'cleared' once a transaction has been " +
+        "vetted and needs no further review.",
+    ),
+  flagColor: flagColorEnum
+    .optional()
+    .describe("Set the flag color (e.g. to mark a row during review)."),
+};
+
+// The two bulk-tool ARRAY ELEMENT schemas, named so their row TYPE can be derived
+// from them with z.infer (below) instead of hand-maintained. Unlike the single
+// update_transaction (whose inputSchema is a raw shape — a bare object), each
+// bulk element is a full z.object(...). A bulk-update row locates the target by
+// transactionId then carries any optional edit; a create row makes
+// accountId/date/amount REQUIRED and shares the same optional tail.
+const bulkRowSchema = z.object({
+  transactionId: z.string().describe("The id of the transaction to update."),
+  ...txnOptionalFields,
+  amount: dollarAmount
+    .optional()
+    .describe("Set the amount in DOLLARS (negative for outflow, e.g. -43.21)."),
+  date: isoDate
+    .optional()
+    .describe("Set the date (YYYY-MM-DD). No future dates."),
+});
+
+const newRowSchema = z.object({
+  accountId: z
+    .string()
+    .describe("The account to add the transaction to (required)."),
+  date: isoDate.describe("The transaction date, YYYY-MM-DD (required)."),
+  amount: dollarAmount.describe(
+    "The amount in DOLLARS, negative for an outflow (required).",
+  ),
+  ...txnOptionalFields,
+});
+
 // --- 4. Register the read-only "list_budgets" tool -------------------------
 // (A) name + config = the Claude-facing interface. The description is how
 //     Claude decides WHEN to call this tool, so it's worth writing clearly.
@@ -493,58 +593,16 @@ server.registerTool(
       transactionId: z
         .string()
         .describe("The id of the transaction to update."),
-      categoryId: z
-        .string()
-        .optional()
-        .describe(
-          "Assign this category (a category id from list_categories). " +
-            "Cannot be changed on a split transaction.",
-        ),
-      payeeName: z
-        .string()
-        .optional()
-        .describe(
-          "Set the payee name. Resolves to an existing payee or creates one. " +
-            "For a transfer, use transferAccountId instead (not payeeName).",
-        ),
-      transferAccountId: z
-        .string()
-        .optional()
-        .describe(
-          "Turn this row into a transfer INTO the given account (its id from " +
-            "list_accounts) — e.g. a credit-card payment or a move to savings. " +
-            "The tool resolves that account's transfer payee for you. A transfer " +
-            "should not also carry a spending category. Cannot be combined with " +
-            "payeeName.",
-        ),
-      memo: z.string().optional().describe("Set the transaction memo/note."),
-      amount: z
-        .number()
+      ...txnOptionalFields,
+      amount: dollarAmount
         .optional()
         .describe(
           "Set the amount in DOLLARS (negative for outflow, e.g. -43.21). " +
             "Converted to YNAB milliunits internally.",
         ),
-      date: z
-        .string()
-        .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO format YYYY-MM-DD")
+      date: isoDate
         .optional()
         .describe("Set the transaction date (YYYY-MM-DD). No future dates."),
-      approved: z
-        .boolean()
-        .optional()
-        .describe("Mark the transaction approved (true) or unapproved (false)."),
-      cleared: z
-        .enum(["cleared", "uncleared", "reconciled"])
-        .optional()
-        .describe(
-          "Set the cleared status. Mark 'cleared' once a transaction has been " +
-            "vetted and needs no further review.",
-        ),
-      flagColor: z
-        .enum(["red", "orange", "yellow", "green", "blue", "purple"])
-        .optional()
-        .describe("Set the flag color (e.g. to mark a row during review)."),
     },
   },
   async ({
@@ -685,20 +743,12 @@ server.registerTool(
 // misfired bulk write and keeps the preview readable. A single tunable constant.
 const MAX_BULK_TRANSACTIONS = 100;
 
-// The shape of one input row after Zod parsing (the single-tool fields, plus the
-// transactionId that locates the row).
-type BulkRow = {
-  transactionId: string;
-  categoryId?: string;
-  payeeName?: string;
-  transferAccountId?: string;
-  memo?: string;
-  amount?: number;
-  date?: string;
-  approved?: boolean;
-  cleared?: "cleared" | "uncleared" | "reconciled";
-  flagColor?: "red" | "orange" | "yellow" | "green" | "blue" | "purple";
-};
+// The shape of one input row after Zod parsing, DERIVED from the schema itself
+// with z.infer — so the static type follows the validators automatically and the
+// two can't drift. (z.infer gives the OUTPUT type, post-parse; z.input would be
+// the pre-parse type. They coincide here because the only .default() — dryRun —
+// lives in the top-level shape, not the row.)
+type BulkRow = z.infer<typeof bulkRowSchema>;
 
 // The SHARED before->after formatter, used by both the dry-run preview and the
 // committed result so the two read identically. Lists only the fields this row
@@ -802,63 +852,8 @@ server.registerTool(
       budgetId: z
         .string()
         .describe("The id of the budget containing the transactions."),
-      // Unlike the top-level inputSchema (a raw shape — a bare object of
-      // validators), each ARRAY ELEMENT is a full z.object(...). Every row
-      // carries a transactionId to locate it, plus any of the same editable
-      // fields the single update_transaction tool exposes (all optional —
-      // send only what you're changing).
       transactions: z
-        .array(
-          z.object({
-            transactionId: z
-              .string()
-              .describe("The id of the transaction to update."),
-            categoryId: z
-              .string()
-              .optional()
-              .describe("Assign this category id (from list_categories)."),
-            payeeName: z
-              .string()
-              .optional()
-              .describe(
-                "Set the payee name (resolves or creates a payee). For a " +
-                  "transfer, use transferAccountId instead.",
-              ),
-            transferAccountId: z
-              .string()
-              .optional()
-              .describe(
-                "Make this row a transfer INTO the given account (its id from " +
-                  "list_accounts) — e.g. a credit-card payment or move to " +
-                  "savings. Resolves that account's transfer payee. Should not " +
-                  "also carry a category; cannot be combined with payeeName.",
-              ),
-            memo: z.string().optional().describe("Set the memo/note."),
-            amount: z
-              .number()
-              .optional()
-              .describe(
-                "Set the amount in DOLLARS (negative for outflow, e.g. -43.21).",
-              ),
-            date: z
-              .string()
-              .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO YYYY-MM-DD")
-              .optional()
-              .describe("Set the date (YYYY-MM-DD). No future dates."),
-            approved: z
-              .boolean()
-              .optional()
-              .describe("Mark approved (true) or unapproved (false)."),
-            cleared: z
-              .enum(["cleared", "uncleared", "reconciled"])
-              .optional()
-              .describe("Set the cleared status."),
-            flagColor: z
-              .enum(["red", "orange", "yellow", "green", "blue", "purple"])
-              .optional()
-              .describe("Set the flag color."),
-          }),
-        )
+        .array(bulkRowSchema)
         .min(1)
         .describe("The transactions to update; one entry per row."),
       dryRun: z
@@ -1092,21 +1087,10 @@ async function getAccountNameMap(
   return map;
 }
 
-// The shape of one input row after Zod parsing. Unlike the update rows, the
-// three fields YNAB requires to create a transaction — accountId, date, amount —
-// are mandatory; the rest are optional.
-type NewRow = {
-  accountId: string;
-  date: string;
-  amount: number;
-  payeeName?: string;
-  categoryId?: string;
-  transferAccountId?: string;
-  memo?: string;
-  approved?: boolean;
-  cleared?: "cleared" | "uncleared" | "reconciled";
-  flagColor?: "red" | "orange" | "yellow" | "green" | "blue" | "purple";
-};
+// Derived from newRowSchema with z.infer (see BulkRow). Unlike the update rows,
+// the three fields YNAB requires to create a transaction — accountId, date,
+// amount — come out non-optional; the shared tail stays optional.
+type NewRow = z.infer<typeof newRowSchema>;
 
 // Render a row we WOULD create (preview): a one-line summary plus indented
 // detail lines for any optional fields that were set. For a transfer the payee
@@ -1156,55 +1140,7 @@ server.registerTool(
         .string()
         .describe("The id of the budget to add transactions to."),
       transactions: z
-        .array(
-          z.object({
-            accountId: z
-              .string()
-              .describe("The account to add the transaction to (required)."),
-            date: z
-              .string()
-              .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be ISO YYYY-MM-DD")
-              .describe("The transaction date, YYYY-MM-DD (required)."),
-            amount: z
-              .number()
-              .describe(
-                "The amount in DOLLARS, negative for an outflow (required).",
-              ),
-            payeeName: z
-              .string()
-              .optional()
-              .describe(
-                "Payee name (resolves or creates a payee). For a transfer, use " +
-                  "transferAccountId instead.",
-              ),
-            categoryId: z
-              .string()
-              .optional()
-              .describe("Category id (from list_categories)."),
-            transferAccountId: z
-              .string()
-              .optional()
-              .describe(
-                "Create this row as a transfer INTO the given account (its id " +
-                  "from list_accounts). Resolves that account's transfer payee. " +
-                  "Should not also carry a category; cannot be combined with " +
-                  "payeeName, and cannot equal this row's own accountId.",
-              ),
-            memo: z.string().optional().describe("Memo/note."),
-            approved: z
-              .boolean()
-              .optional()
-              .describe("Mark approved. Defaults to unapproved if omitted."),
-            cleared: z
-              .enum(["cleared", "uncleared", "reconciled"])
-              .optional()
-              .describe("Cleared status. Defaults to uncleared if omitted."),
-            flagColor: z
-              .enum(["red", "orange", "yellow", "green", "blue", "purple"])
-              .optional()
-              .describe("Flag color."),
-          }),
-        )
+        .array(newRowSchema)
         .min(1)
         .describe("The transactions to create; one entry per row."),
       dryRun: z

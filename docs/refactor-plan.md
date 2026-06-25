@@ -112,27 +112,28 @@ enums from the dependency that owns them; structural typing. This is the
 highest-teaching-value cluster, and the duplication is **already drifting** (the
 `transferAccountId` blurb is worded three different ways).
 
-- [ ] **Build zod enums from the YNAB SDK constants** —
-  `CLEARED_VALUES = Object.values(ynab.TransactionClearedStatus)` and
-  `FLAG_COLORS = Object.values(ynab.TransactionFlagColor).filter(c => c !== "")`
-  (the SDK's `TransactionFlagColor` includes `Empty: ""`, which we deliberately
-  exclude — a teachable filter). Feed them to `z.enum` at all three sites and derive
-  the row-type unions from them. **(small)**
-- [ ] **Define shared editable-field validators and compose them** — a
-  `txnEditableFields` object of the shared *optional* validators (categoryId,
-  payeeName, transferAccountId, memo, amount, date, approved, cleared, flagColor).
-  Spread into `update_transaction`'s raw-shape inputSchema
-  (`{ budgetId, transactionId, ...txnEditableFields }`) and the two bulk array
-  elements. **Scope note:** the three tools do *not* share an identical field set —
-  `create_transactions` has no `transactionId` and makes `accountId`/`date`/`amount`
-  **required**. So the shareable unit is the optional tail + the standalone
-  validators, not one mega-schema. Keep the per-tool `.describe()` text where it
-  genuinely differs (create says "required"; update says optional). **(medium)**
-- [ ] **Derive `BulkRow` / `NewRow` with `z.infer`** — pull each array element into a
-  named schema and replace the hand-written types with
-  `type BulkRow = z.infer<typeof bulkRowSchema>` etc. One terse comment on
-  `z.infer` vs `z.input` (they coincide here because the only `.default()` —
-  `dryRun` — lives in the top-level shape, not the rows). **(small)**
+- [x] **Build zod enums from the YNAB SDK constants** — done a touch differently
+  from the recipe above, after a type probe against installed zod 4: the SDK
+  exports are `as const` objects, and zod 4's `z.enum` accepts the object form
+  directly and infers the value union — so `clearedEnum = z.enum(ynab.TransactionClearedStatus)`
+  and `flagColorEnum = z.enum(ynab.TransactionFlagColor).exclude(["Empty"])`. The
+  object form was chosen over `Object.values(...).filter(...)` because a plain
+  `.filter()` does NOT narrow the array element type (the `""` survives in the
+  inferred type), whereas `.exclude` by member name keeps the literal union clean.
+  Fed to `z.enum` at all three sites. **(small)**
+- [x] **Define shared editable-field validators and compose them** — implemented as
+  `txnOptionalFields` (the seven always-optional fields, each fully-formed with one
+  canonical description) spread into all three schemas, plus two standalone base
+  validators `dollarAmount` / `isoDate` (kept base because amount/date are optional
+  on update but required on create — each tool adds optionality + wording). Net
+  ~90 lines deleted and the three-way drift in the `transferAccountId`/cleared/etc.
+  blurbs collapsed to one source. Field order shifted (cosmetic — handler
+  destructures by name). **(medium)**
+- [x] **Derive `BulkRow` / `NewRow` with `z.infer`** — pulled each array element into
+  `bulkRowSchema` / `newRowSchema` and replaced the hand-written types with
+  `z.infer<typeof …>`. The clean compile is the proof (the formatters consume the
+  types). Comment notes `z.infer` (output) vs `z.input` coincide here because the
+  only `.default()` (dryRun) lives in the top-level shape, not the rows. **(small)**
 
 ---
 
