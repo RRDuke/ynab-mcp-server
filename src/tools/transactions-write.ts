@@ -179,7 +179,7 @@ export function registerTransactionWriteTools(
           ),
         date: isoDate
           .optional()
-          .describe("Set the transaction date (YYYY-MM-DD). No future dates."),
+          .describe("Set the transaction date (YYYY-MM-DD)."),
       },
     },
     async ({
@@ -571,8 +571,10 @@ export function registerTransactionWriteTools(
         "outflow); payeeName, categoryId, memo, approved, cleared, and flagColor " +
         "are optional. MUTATES data, but dryRun defaults to TRUE: the call " +
         `previews the rows it would create without writing — pass dryRun:false to ` +
-        `commit. Up to ${MAX_BULK_TRANSACTIONS} rows per call. Use list_accounts ` +
-        "for accountId and list_categories for categoryId.",
+        `commit. Up to ${MAX_BULK_TRANSACTIONS} rows per call. NOT idempotent: ` +
+        "YNAB does no content dedup, so committing the same rows twice creates " +
+        "duplicates. Use list_accounts for accountId and list_categories for " +
+        "categoryId.",
       inputSchema: {
         budgetId: z
           .string()

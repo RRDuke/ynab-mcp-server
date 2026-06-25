@@ -206,13 +206,12 @@ framing the in-memory ones honestly as **clarity** wins, not speed.
 envelopes. Lower severity than Phases 1–3, and partly lands for free during the
 Phase-3 extraction.
 
-- [ ] **Merge the two `getAccounts` calls into one `getAccountMaps()`** returning
-  `{ names, transferPayees }` from a single `getAccounts` loop, then wrap the
-  *independent* reads in `update_transactions` / `create_transactions` in
-  `Promise.all`. _Why:_ verified each bulk write currently fires **two
-  byte-identical `getAccounts` requests** (the SDK does no dedup) plus serial
-  awaits. This is the one real round-trip waste. Race-free because
-  `getAllTransactions` is the sole cache writer. **(small)**
+- [x] **Merge the two `getAccounts` calls into one `getAccountMaps()`** returning
+  `{ names, transferPayees }` from a single `getAccounts` loop — **done during
+  Phase 3** (folded into the `ynab/lookups.ts` extraction). Each bulk write now
+  fires one `getAccounts` request, not two. _Still open (minor):_ wrap the
+  independent category + account reads in `Promise.all` — one serial await per
+  bulk write. **(small)**
 - [ ] **Extract `textResult()` / `fail()` and a field-mapping helper** —
   `textResult = (text) => ({ content: [{ type: "text" as const, text }] })` (the
   `as const` is *required* so the factory matches the SDK's literal-typed content
@@ -225,13 +224,17 @@ Phase-3 extraction.
   stops rebuilding `new Map(all.map(...))`. Return an **accessor, not the raw
   mutable Map** (avoids cache-corruption footguns). _Be honest with yourself:_ the
   runtime win is ~zero (network dominates) — do it for the pattern. **(small)**
-- [ ] **Optional honesty pass** — document (and optionally guard) that
-  category/amount/date edits are ignored on split parents; make the "No future
-  dates" descriptions honest (drop the claim or add a real today-ISO guard on
-  create, noting the `toISOString` UTC-vs-Pacific edge); add a one-line "not
-  idempotent — re-running creates duplicates" caveat to `create_transactions` and
-  keep `import_id` dedup **deferred to the backfill step** (program step 6).
-  **(medium)**
+- [x] **Honesty pass** — **dropped** the "No future dates" claim from both date
+  descriptions (it was unenforced by our code, so the tool was misdescribing its
+  own behavior); added a "NOT idempotent — committing the same rows twice creates
+  duplicates" caveat to `create_transactions` (with `import_id` dedup still
+  **deferred to the backfill step**, program step 6). Left the split-parent note
+  as-is on `categoryId` ("can't be changed on a split") — accurate; did not assert
+  amount/date split-parent behavior without verifying it. **(small as done)**
+
+> Still open (all explicitly optional polish — file is clean enough that none is
+> pressing): `Promise.all` on the two independent bulk reads; `textResult()` /
+> `applySharedFields()` DRY; `getTransactionById` accessor (runtime win ~zero).
 
 ---
 

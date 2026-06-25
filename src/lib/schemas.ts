@@ -90,7 +90,7 @@ export const bulkRowSchema = z.object({
     .describe("Set the amount in DOLLARS (negative for outflow, e.g. -43.21)."),
   date: isoDate
     .optional()
-    .describe("Set the date (YYYY-MM-DD). No future dates."),
+    .describe("Set the date (YYYY-MM-DD)."),
 });
 
 export const newRowSchema = z.object({
