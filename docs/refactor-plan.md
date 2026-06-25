@@ -177,21 +177,22 @@ src/tools/transactions-write.ts— registerTransactionWriteTools(server, api) +
 
 **Migration order (run `npm run build && npx tsx scripts/smoke-test.ts` after EACH):**
 
-- [ ] **1. Pure leaves first** — `src/lib/money.ts` and `src/lib/schemas.ts`. No
-  client dependency; proves the nodenext `.js`-import wiring without touching the
-  closure problem. **(small)**
-- [ ] **2. `src/ynab/cache.ts` + `src/ynab/lookups.ts`, injecting `api`** — convert
-  each helper from closing over the module-global `ynabAPI` to taking an explicit
-  `api` param: `getAllTransactions(api, budgetId, forceRefresh)`,
-  `getAccountMaps(api, budgetId)`, etc. The `transactionCache` Map **stays
-  module-level** — that contrast (injected collaborator vs shared singleton) is the
-  durable lesson. _(Fold the Phase-4 `getAccountMaps` merge in here, since you're
-  already touching these.)_ **(medium)**
-- [ ] **3. Wrap registrations** — move the read tools into
-  `registerReadTools(server, api)` and the four write tools + formatters into
-  `registerTransactionWriteTools(server, api)`. `server.ts` becomes the ~40-line
-  thin entry. `transactions-write.ts` will be ~1,000 lines — **that's fine**; the
-  four tools share real machinery. Revisit only if it actually hurts. **(medium)**
+- [x] **1. Pure leaves first** — `src/lib/money.ts` (30 lines) and
+  `src/lib/schemas.ts` (113). No client dependency; proved the nodenext
+  `.js`-import wiring without touching the closure problem. **(small)**
+- [x] **2. `src/ynab/cache.ts` + `src/ynab/lookups.ts`, injecting `api`** — each
+  helper now takes an explicit `api` param: `getAllTransactions(api, budgetId,
+  forceRefresh)`, `getAccountMaps(api, budgetId)`, `getCategoryNameMap(api,
+  budgetId)`. `transactionCache` Map STAYS module-level (the injected-collaborator
+  vs shared-singleton contrast). The error boundary (`ynabErrorText`/`ynabCall`)
+  moved to `ynab/client.ts`. Folded in the Phase-4 `getAccountMaps` merge: the two
+  byte-identical `getAccounts` calls the bulk tools fired are now one. **(medium)**
+- [x] **3. Wrap registrations** — read tools in `registerReadTools(server, api)`
+  (`tools/read.ts`, 275), the four write tools + formatters + `fail` in
+  `registerTransactionWriteTools(server, api)` (`tools/transactions-write.ts`,
+  796), `createYnabClient` in `ynab/client.ts`. `server.ts` is now a 66-line thin
+  entry (was 1,124). Smoke green after each step; all 8 tools verified identical.
+  **(medium)**
 
 ---
 
