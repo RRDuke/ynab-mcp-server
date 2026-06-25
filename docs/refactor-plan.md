@@ -224,13 +224,17 @@ Phase-3 extraction.
   stops rebuilding `new Map(all.map(...))`. Return an **accessor, not the raw
   mutable Map** (avoids cache-corruption footguns). _Be honest with yourself:_ the
   runtime win is ~zero (network dominates) — do it for the pattern. **(small)**
-- [x] **Honesty pass** — **dropped** the "No future dates" claim from both date
-  descriptions (it was unenforced by our code, so the tool was misdescribing its
-  own behavior); added a "NOT idempotent — committing the same rows twice creates
-  duplicates" caveat to `create_transactions` (with `import_id` dedup still
-  **deferred to the backfill step**, program step 6). Left the split-parent note
-  as-is on `categoryId` ("can't be changed on a split") — accurate; did not assert
-  amount/date split-parent behavior without verifying it. **(small as done)**
+- [x] **Honesty pass** — first wrongly dropped "No future dates" on a bad
+  assumption it was inaccurate; then VERIFIED against the SDK's own model docs
+  (`NewTransaction.d.ts` et al., from YNAB's OpenAPI spec): _"Future dates
+  (scheduled transactions) are not permitted. Split transaction dates cannot be
+  changed and if a different date is supplied it will be ignored."_ So the claim
+  was TRUE — restored it on all three date fields (incl. create, where it also
+  applies) as accurate guidance that helps Claude avoid a 400 (now readable post
+  Phase 1). Added a "NOT idempotent — committing the same rows twice creates
+  duplicates" caveat to `create_transactions` (`import_id` dedup still **deferred
+  to the backfill step**, program step 6). The SDK also confirms split-parent
+  dates are ignored — a documented fact if we want to surface it later. **(small)**
 
 > Still open (all explicitly optional polish — file is clean enough that none is
 > pressing): `Promise.all` on the two independent bulk reads; `textResult()` /

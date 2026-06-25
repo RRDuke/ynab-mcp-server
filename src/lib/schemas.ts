@@ -90,14 +90,17 @@ export const bulkRowSchema = z.object({
     .describe("Set the amount in DOLLARS (negative for outflow, e.g. -43.21)."),
   date: isoDate
     .optional()
-    .describe("Set the date (YYYY-MM-DD)."),
+    .describe("Set the date (YYYY-MM-DD). No future dates — YNAB rejects them."),
 });
 
 export const newRowSchema = z.object({
   accountId: z
     .string()
     .describe("The account to add the transaction to (required)."),
-  date: isoDate.describe("The transaction date, YYYY-MM-DD (required)."),
+  date: isoDate.describe(
+    "The transaction date, YYYY-MM-DD (required). No future dates — YNAB " +
+      "rejects them.",
+  ),
   amount: dollarAmount.describe(
     "The amount in DOLLARS, negative for an outflow (required).",
   ),

@@ -179,7 +179,10 @@ export function registerTransactionWriteTools(
           ),
         date: isoDate
           .optional()
-          .describe("Set the transaction date (YYYY-MM-DD)."),
+          .describe(
+            "Set the transaction date (YYYY-MM-DD). No future dates — YNAB " +
+              "rejects them.",
+          ),
       },
     },
     async ({
