@@ -202,6 +202,12 @@ the backfill (step 6).
 ### Milestone 5 — Phase 2: configure the budget
 Reshape the budget structure based on the M4 analysis.
 
+> Codebase note (session #8): the server was refactored into domain modules
+> (`docs/refactor-plan.md`, Phases 1–3 ✅). M5's tools are born in their OWN
+> `src/tools/categories.ts` via a `registerCategoryTools(server, api)` function —
+> not the old monolith. New helpers (e.g. a category-group lookup) go in
+> `src/ynab/lookups.ts`. Keep tool names `snake_case verb_noun`.
+
 - `create_category_group` — `createCategoryGroup`; new top-level groupings.
 - `create_category` — `createCategory`; new categories within a group.
 - `update_category` — `updateCategory`. Body includes `category_group_id`, so

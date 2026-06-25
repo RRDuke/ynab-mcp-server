@@ -1,5 +1,13 @@
 # YNAB MCP server — refactor & hardening plan
 
+> **STATUS (2026-06-25, session #8): Phases 1–3 COMPLETE; Phase 4 = optional
+> leftovers.** Commits: `09b105b` (P1) · `dbb94f6` (P2) · `aa15ae0` (P3) ·
+> `440dd21`+`c2d8540` (P4 honesty pass). `src/server.ts` went 1,124 → 66 lines
+> over an 8-module tree; the `getAccountMaps` merge landed in P3. Remaining P4
+> items (`Promise.all` on bulk reads, `textResult`/`applySharedFields` DRY,
+> `getTransactionById` accessor) are deferred as low-value polish. Checkboxes
+> below carry the per-step decisions.
+
 _Created 2026-06-24 (build session #6). A planning artifact from a multi-agent
 architecture review of `src/server.ts`. **No code was changed to produce this** —
 it's the roadmap for the cleanup work, sequenced to keep the smoke test green and
