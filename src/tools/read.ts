@@ -269,6 +269,20 @@ export function registerReadTools(server: McpServer, api: ynab.API): void {
         text = `Transactions${scope} — showing ${start}-${end} of ${total}:\n${lines}`;
       }
 
+      // A forced refresh reports what actually came back, so a truncated
+      // re-fetch is visible to the caller — not only in server stderr (Bug #1's
+      // wrong answer survived because the response looked authoritative).
+      if (refresh) {
+        const oldest = all.reduce<string | undefined>(
+          (min, t) => (min === undefined || t.date < min ? t.date : min),
+          undefined,
+        );
+        text =
+          `Refreshed from YNAB: re-fetched ${all.length} transaction(s)` +
+          (oldest ? ` (oldest ${oldest})` : "") +
+          `.\n${text}`;
+      }
+
       return { content: [{ type: "text", text }] };
     },
   );

@@ -60,7 +60,40 @@ await callAndPrint("list_categories", { budgetId });
 
 // list_transactions: exercise delta caching + paging + the type filter.
 // First call = full fetch (watch for the server's "[cache] ... full fetch").
-await callAndPrint("list_transactions", { budgetId, limit: 3 });
+const firstPageText = await callAndPrint("list_transactions", {
+  budgetId,
+  limit: 3,
+});
+
+// Bug #1 regression tripwires. These thresholds are GROUND TRUTH for Rob's real
+// budget ("Budgets are kewl"): ~20,855 transactions back to 2016-11-28 as of
+// 2026-07-28, growing over time. The truncated cache reported 2,558 rows
+// starting 2025-07-28 — so both assertions have wide margins on each side.
+const total = Number(firstPageText.match(/of (\d+):/)?.[1] ?? 0);
+if (total < 15000) {
+  console.error(
+    `\nFAIL: cache holds ${total} transactions, expected >= 15,000 — ` +
+      `the full fetch looks truncated (Bug #1).`,
+  );
+  await client.close();
+  process.exit(1);
+}
+// Page directly to the oldest row (newest-first sort => last row is oldest).
+const oldestRowText = await callAndPrint("list_transactions", {
+  budgetId,
+  limit: 1,
+  offset: total - 1,
+});
+const oldestDate = oldestRowText.match(/- (\d{4}-\d{2}-\d{2}) \|/)?.[1];
+if (!oldestDate || oldestDate >= "2017-01-01") {
+  console.error(
+    `\nFAIL: oldest transaction is ${oldestDate ?? "unparseable"}, expected ` +
+      `pre-2017 history — the full fetch looks truncated (Bug #1).`,
+  );
+  await client.close();
+  process.exit(1);
+}
+
 // Second call = cheap delta reuse ("[cache] ... delta merged"), page 2.
 await callAndPrint("list_transactions", { budgetId, limit: 3, offset: 3 });
 // Type filter: only rows still needing a category.

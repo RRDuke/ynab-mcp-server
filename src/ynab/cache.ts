@@ -23,6 +23,20 @@ interface TransactionCacheEntry {
 // Keyed by budgetId — each budget syncs independently.
 const transactionCache = new Map<string, TransactionCacheEntry>();
 
+// YNAB's GET /transactions with NO since_date does NOT return the whole budget —
+// it returns only a trailing ~12-month window (verified against api.ynab.com
+// 2026-07-28; Bug #1). A full fetch must pass an explicit floor date to get
+// everything. Delta calls still pass undefined: serverKnowledge governs those,
+// and passing both would ask YNAB an ambiguous question we don't need answered.
+const FULL_FETCH_SINCE_DATE = "1900-01-01";
+
+// Tolerance for the truncation guard below. first_month is the FIRST DAY of the
+// budget's first month, so the oldest transaction can legitimately land later
+// in that month (27 days later on this budget). One quarter cleanly separates
+// that from the failure being guarded against (~9 years of missing history).
+const TRUNCATION_TOLERANCE_DAYS = 92;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
 // Returns the complete, current transaction set for a budget; callers apply
 // their own date/type/paging filters on top. forceRefresh discards the cache
 // and re-downloads everything from scratch.
@@ -33,12 +47,14 @@ export async function getAllTransactions(
 ): Promise<ynab.TransactionDetail[]> {
   const cached = forceRefresh ? undefined : transactionCache.get(budgetId);
 
-  // Fetch the WHOLE budget (no sinceDate/type) so the cache stays complete and
-  // delta sync stays coherent. cursor undefined on the first call -> full set.
+  // Full fetch (no cache): pass the explicit since_date floor — without it YNAB
+  // silently returns only the trailing ~12 months (Bug #1). Delta fetch (cache
+  // present): since_date stays undefined; the serverKnowledge cursor decides
+  // what comes back.
   const response = await ynabCall(
     api.transactions.getTransactions(
       budgetId,
-      undefined,
+      cached ? undefined : FULL_FETCH_SINCE_DATE,
       undefined,
       cached?.serverKnowledge,
     ),
@@ -62,5 +78,50 @@ export async function getAllTransactions(
     serverKnowledge: response.data.server_knowledge,
     byId,
   });
+
+  // Full fetches get cross-checked against the budget's own first_month; a
+  // cache that starts materially later than the budget itself is always a bug.
+  if (!cached) await warnIfTruncated(api, budgetId, byId);
+
   return [...byId.values()];
+}
+
+// The truncation guard. This class of bug (Bug #1) produces confident,
+// well-formed, silently-wrong answers, so the fix comes with an alarm: after a
+// full fetch, compare the cache's oldest transaction date against the budget's
+// first_month from the plans summary. Diagnostics must never break a working
+// read — this only warns on stderr, and swallows its own failures.
+async function warnIfTruncated(
+  api: ynab.API,
+  budgetId: string,
+  byId: Map<string, ynab.TransactionDetail>,
+): Promise<void> {
+  try {
+    const response = await ynabCall(api.plans.getPlans());
+    const firstMonth = response.data.plans.find(
+      (p) => p.id === budgetId,
+    )?.first_month;
+    if (!firstMonth || byId.size === 0) return; // nothing to compare against
+
+    let oldest: string | undefined;
+    for (const txn of byId.values()) {
+      if (oldest === undefined || txn.date < oldest) oldest = txn.date;
+    }
+    if (oldest === undefined) return;
+
+    const gapDays = (Date.parse(oldest) - Date.parse(firstMonth)) / MS_PER_DAY;
+    if (gapDays > TRUNCATION_TOLERANCE_DAYS) {
+      console.error(
+        `[cache] ⚠️ TRUNCATION SUSPECTED for ${budgetId}: oldest cached ` +
+          `transaction is ${oldest}, but the budget's first month is ` +
+          `${firstMonth}. The cache is likely missing history — this is the ` +
+          `Bug #1 failure class.`,
+      );
+    }
+  } catch (e) {
+    console.error(
+      `[cache] truncation guard skipped (plans lookup failed): ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
 }

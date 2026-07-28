@@ -65,6 +65,19 @@ Open items carried forward:
 - "Internal Master Category" group shows through in `list_categories` (not
   flagged hidden by the API). Decide whether to filter it by name.
 
+### Bug #1 fix — silent ~12-month cache truncation (2026-07-28)
+Found in production use: `GET /transactions` with no `since_date` returns only a
+trailing ~12-month window, NOT the whole budget — the cache's full fetch assumed
+otherwise, so every tool (reads AND writes, which look up rows in the same
+cache) silently saw 2,558 of 20,855 transactions. Fixed: full fetches pass an
+explicit `since_date` floor (delta calls still rely on `serverKnowledge` alone);
+a truncation guard cross-checks the cache's oldest row against the plan's
+`first_month` and alarms on stderr; `refresh: true` now reports what it
+re-fetched; smoke test gained ground-truth tripwires (total >= 15,000, oldest
+pre-2017). Also added `scripts/export-transactions.ts` (full-history JSON/CSV
+export). Lesson (same class as the session-#8 one): verify what an omitted API
+parameter does — the wrong assumption lived in a confident comment.
+
 ## Planned
 
 The overall goal driving M4/M5: have Claude help **review, clean, and
