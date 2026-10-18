@@ -27,13 +27,6 @@ console.log(
   "Tools advertised:",
   tools.map((t) => t.name),
 );
-// import_transactions has no dryRun (any call really imports), so the smoke
-// test only checks it's advertised and never calls it.
-if (!tools.some((t) => t.name === "import_transactions")) {
-  console.error("\nFAIL: import_transactions is not advertised.");
-  await client.close();
-  process.exit(1);
-}
 
 // Small helper: call a tool and print the first text block it returns.
 // callTool's result.content is the { type, text }[] array our server built.
@@ -60,6 +53,25 @@ if (!budgetId) {
   process.exit(1);
 }
 console.log(`\n>>> Using budgetId ${budgetId} for the remaining tools.`);
+
+// 2b. import_transactions — a REAL call (it has no dryRun), so it targets the
+//     live "Post Fire Reboot" budget by name and never the archived one, whose
+//     linked accounts would import into a dead budget. Pressing Import is
+//     harmless (additive, deduped by YNAB); 0 imported is a pass.
+const liveBudgetId = budgetsText.match(
+  /- Post Fire Reboot \(id: ([0-9a-f-]+)\)/,
+)?.[1];
+const importText = liveBudgetId
+  ? await callAndPrint("import_transactions", { budgetId: liveBudgetId })
+  : "";
+if (!/^(Import ran for budget|Imported \d+ transaction)/.test(importText)) {
+  console.error(
+    `\nFAIL: import_transactions reply is malformed or the live budget ` +
+      `wasn't found: ${JSON.stringify(importText)}`,
+  );
+  await client.close();
+  process.exit(1);
+}
 
 // 3. The argument-taking read tools, against the real budget.
 const accountsText = await callAndPrint("list_accounts", { budgetId });

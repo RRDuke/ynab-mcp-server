@@ -87,7 +87,8 @@ date/payee/amount/account. No dryRun — there's nothing to preview, the effect 
 additive, and YNAB dedupes on `import_id`. Lives in
 `src/tools/transactions-import.ts`. Verified live on Post Fire Reboot (0 waiting
 → clean "nothing new" message) and on a bogus id (`isError`, readable YNAB
-error). The smoke test asserts it's advertised but never calls it. Not yet
+error). The smoke test makes a real call on Post Fire Reboot (by name, never
+the archived budget) and checks the reply shape; 0 imported passes. Not yet
 exercised: the row-echo path with a non-empty import.
 
 ## Planned

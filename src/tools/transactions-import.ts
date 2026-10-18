@@ -39,7 +39,9 @@ export function registerImportTools(server: McpServer, api: ynab.API): void {
         "(direct-import) account in a budget — the same as pressing the " +
         "app's \"Import\" button on each account. Provide budgetId. Returns " +
         "the transactions that were imported (they arrive unapproved, ready " +
-        "for review). Accounts that aren't bank-linked are unaffected. " +
+        "for review). It can only return what YNAB's bank-data provider has " +
+        "already received, so a charge the bank hasn't sent yet won't appear. " +
+        "Accounts that aren't bank-linked are unaffected. " +
         "MUTATES data (adds transactions); no dryRun, since there is nothing " +
         "to preview.",
       inputSchema: {
