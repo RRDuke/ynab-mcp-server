@@ -78,6 +78,18 @@ pre-2017). Also added `scripts/export-transactions.ts` (full-history JSON/CSV
 export). Lesson (same class as the session-#8 one): verify what an omitted API
 parameter does — the wrong assumption lived in a confident comment.
 
+### `import_transactions` — the app's "Import" button (2026-10-18)
+`POST /plans/{id}/transactions/import` via the SDK's
+`transactions.importTransactions(planId)`: asks every linked (direct-import)
+account in the budget to pull pending transactions from its bank. Returns only
+the new ids, so the tool resolves them through the cache (cheap delta) to echo
+date/payee/amount/account. No dryRun — there's nothing to preview, the effect is
+additive, and YNAB dedupes on `import_id`. Lives in
+`src/tools/transactions-import.ts`. Verified live on Post Fire Reboot (0 waiting
+→ clean "nothing new" message) and on a bogus id (`isError`, readable YNAB
+error). The smoke test asserts it's advertised but never calls it. Not yet
+exercised: the row-echo path with a non-empty import.
+
 ## Planned
 
 The overall goal driving M4/M5: have Claude help **review, clean, and
