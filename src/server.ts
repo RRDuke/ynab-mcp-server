@@ -20,6 +20,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createYnabClient } from "./ynab/client.js";
 import { registerReadTools } from "./tools/read.js";
 import { registerTransactionWriteTools } from "./tools/transactions-write.js";
+import { registerImportTools } from "./tools/transactions-import.js";
 
 // Build the YNAB API client (token check happens inside; it exits if absent).
 const api = createYnabClient(process.env.YNAB_TOKEN);
@@ -49,6 +50,7 @@ const server = new McpServer(
 // Register the tools, grouped by domain. The api client is injected into each.
 registerReadTools(server, api);
 registerTransactionWriteTools(server, api);
+registerImportTools(server, api);
 
 // --- Connect over stdio and start serving ----------------------------------
 // StdioServerTransport = Claude launches this file as a child process and

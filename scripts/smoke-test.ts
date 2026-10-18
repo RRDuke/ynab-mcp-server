@@ -27,6 +27,13 @@ console.log(
   "Tools advertised:",
   tools.map((t) => t.name),
 );
+// import_transactions has no dryRun (any call really imports), so the smoke
+// test only checks it's advertised and never calls it.
+if (!tools.some((t) => t.name === "import_transactions")) {
+  console.error("\nFAIL: import_transactions is not advertised.");
+  await client.close();
+  process.exit(1);
+}
 
 // Small helper: call a tool and print the first text block it returns.
 // callTool's result.content is the { type, text }[] array our server built.
