@@ -55,12 +55,17 @@ if (!budgetId) {
 console.log(`\n>>> Using budgetId ${budgetId} for the remaining tools.`);
 
 // 2b. import_transactions — a REAL call (it has no dryRun), so it targets the
-//     live "Post Fire Reboot" budget by name and never the archived one, whose
+//     live budget by name (YNAB_LIVE_BUDGET in .env) and never the archived one, whose
 //     linked accounts would import into a dead budget. Pressing Import is
 //     harmless (additive, deduped by YNAB); 0 imported is a pass.
-const liveBudgetId = budgetsText.match(
-  /- Post Fire Reboot \(id: ([0-9a-f-]+)\)/,
-)?.[1];
+const liveBudgetName = process.env.YNAB_LIVE_BUDGET;
+const escapeRegExp = (str: string) =>
+  str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const liveBudgetId = liveBudgetName
+  ? budgetsText.match(
+      new RegExp(`- ${escapeRegExp(liveBudgetName)} \\(id: ([0-9a-f-]+)\\)`),
+    )?.[1]
+  : undefined;
 const importText = liveBudgetId
   ? await callAndPrint("import_transactions", { budgetId: liveBudgetId })
   : "";
@@ -84,8 +89,8 @@ const firstPageText = await callAndPrint("list_transactions", {
   limit: 3,
 });
 
-// Bug #1 regression tripwires. These thresholds are GROUND TRUTH for Rob's real
-// budget ("Budgets are kewl"): ~20,855 transactions back to 2016-11-28 as of
+// Bug #1 regression tripwires. These thresholds are GROUND TRUTH for the author's real
+// budget (the old one): ~20,855 transactions back to 2016-11-28 as of
 // 2026-07-28, growing over time. The truncated cache reported 2,558 rows
 // starting 2025-07-28 — so both assertions have wide margins on each side.
 const total = Number(firstPageText.match(/of (\d+):/)?.[1] ?? 0);

@@ -8,7 +8,7 @@ registered on the MCP server in `src/server.ts` and verified via
 
 The tools exist to serve a larger data-cleanup-and-migration program. Context:
 
-- The live budget **"Budgets are kewl"** has been **connected to bank data for
+- The long-running budget (the "old budget" below) has been **connected to bank data for
   several years but left largely unattended.** As a result the transaction data
   has **both duplicates and gaps** (missing sources): some bank connections have
   failed over time, others are still active.
@@ -35,7 +35,7 @@ The program, in order:
 5. **Download as much historical data as possible** — pull whatever the freshly
    connected banks will give (fresh connections typically backfill only a short
    window, which is exactly why the old plan's history matters).
-6. **Integrate confirmed-good data from "Budgets are kewl"** — backfill the
+6. **Integrate confirmed-good data from the old budget** — backfill the
    fresh plan with the de-duped, validated historical transactions from the old
    plan, using `create_transaction` (bulk). The old plan is the long-tail
    history the new bank connections can't reproduce.
@@ -85,9 +85,9 @@ account in the budget to pull pending transactions from its bank. Returns only
 the new ids, so the tool resolves them through the cache (cheap delta) to echo
 date/payee/amount/account. No dryRun — there's nothing to preview, the effect is
 additive, and YNAB dedupes on `import_id`. Lives in
-`src/tools/transactions-import.ts`. Verified live on Post Fire Reboot (0 waiting
+`src/tools/transactions-import.ts`. Verified live on the live budget (0 waiting
 → clean "nothing new" message) and on a bogus id (`isError`, readable YNAB
-error). The smoke test makes a real call on Post Fire Reboot (by name, never
+error). The smoke test makes a real call on the live budget (by name, never
 the archived budget) and checks the reply shape; 0 imported passes. Not yet
 exercised: the row-echo path with a non-empty import.
 
@@ -149,7 +149,7 @@ our own write with no invalidation.
   the action is set category + `approved: true`). Every field but `id` is
   optional. First tool to carry the dryRun/echo-back/batch-cap safety machinery.
   **DONE 2026-06-12**, verified live: categorized all 12 uncategorized "The New
-  York Times" rows ($18/mo subscription on Jen Freedom New) -> Content
+  York Times" rows ($18/mo subscription) -> Content
   Subscriptions + approved, then a fresh read confirmed 0 remain (read-your-write
   via the delta cache). Mirrors the single tool's field mapping per row; shares
   the `describeRowChanges` formatter between preview and commit (the `after` arg
